@@ -305,6 +305,7 @@ async function handleInteraction(request, env) {
               issue_number: issueNumber,
               github_username: githubUsername,
               slack_user_id: userId,
+              slack_channel_id: channelId,
             });
           }
         } catch (e) {

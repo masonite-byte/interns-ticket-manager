@@ -21,6 +21,7 @@ func main() {
 	githubRepo := os.Getenv("GITHUB_REPO")
 	slackToken := os.Getenv("SLACK_BOT_TOKEN")
 	slackUserID := os.Getenv("SLACK_USER_ID")
+	slackChannelID := os.Getenv("SLACK_CHANNEL_ID")
 
 	if issueNumber == "" || githubUsername == "" || githubToken == "" || githubRepo == "" {
 		slog.Error("missing required env vars")
@@ -34,11 +35,21 @@ func main() {
 
 	slog.Info("assigned issue", "number", issueNumber, "user", githubUsername)
 
-	if slackToken != "" && slackUserID != "" {
+	if slackToken != "" {
 		client := slack.New(slackToken)
-		msg := fmt.Sprintf("✅ Issue #%s has been assigned to you on GitHub.", issueNumber)
-		if _, _, err := client.PostMessage(slackUserID, slack.MsgOptionText(msg, false)); err != nil {
-			slog.Error("failed to DM user", "error", err)
+
+		if slackUserID != "" {
+			dm := fmt.Sprintf("✅ Issue #%s has been assigned to you on GitHub.", issueNumber)
+			if _, _, err := client.PostMessage(slackUserID, slack.MsgOptionText(dm, false)); err != nil {
+				slog.Error("failed to DM user", "error", err)
+			}
+		}
+
+		if slackChannelID != "" {
+			announcement := fmt.Sprintf("<@%s> claimed issue #%s and has been assigned on GitHub.", slackUserID, issueNumber)
+			if _, _, err := client.PostMessage(slackChannelID, slack.MsgOptionText(announcement, false)); err != nil {
+				slog.Error("failed to post to channel", "error", err)
+			}
 		}
 	}
 }

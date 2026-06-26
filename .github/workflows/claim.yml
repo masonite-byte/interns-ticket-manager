@@ -13,6 +13,10 @@ on:
         description: 'Slack user ID to notify on completion'
         required: false
         default: ''
+      slack_channel_id:
+        description: 'Slack channel to announce the claim in'
+        required: false
+        default: ''
 
 jobs:
   run:
@@ -33,3 +37,4 @@ jobs:
           GITHUB_USERNAME: ${{ inputs.github_username }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_USER_ID: ${{ inputs.slack_user_id }}
+          SLACK_CHANNEL_ID: ${{ inputs.slack_channel_id }}
