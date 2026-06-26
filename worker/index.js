@@ -1,6 +1,7 @@
 const HELP_TEXT = [
   'Supported slash commands:',
   '/claim     - pick an unclaimed issue to work on.',
+  '/abandon   - drop an issue you previously claimed.',
   '/tickets   - show all currently claimed tickets.',
   '/ping      - check that the bot is alive.',
   '/help      - show this help text.',
@@ -117,6 +118,50 @@ async function postEphemeral(channelId, userId, text, env) {
   });
 }
 
+async function openAbandonModal(triggerId, claims, channelId, env) {
+  const options = claims.map(claim => ({
+    text: { type: 'plain_text', text: `#${claim.issueNumber} ${claim.issueTitle}`.slice(0, 75) },
+    value: String(claim.issueNumber),
+  }));
+
+  const modal = {
+    type: 'modal',
+    callback_id: 'abandon_issue',
+    private_metadata: JSON.stringify({ channel_id: channelId }),
+    title: { type: 'plain_text', text: 'Abandon an Issue' },
+    submit: { type: 'plain_text', text: 'Abandon' },
+    close: { type: 'plain_text', text: 'Cancel' },
+    blocks: [
+      {
+        type: 'section',
+        text: { type: 'mrkdwn', text: 'Pick an issue to drop. It will be unassigned on GitHub and back in the pool.' },
+      },
+      {
+        type: 'input',
+        block_id: 'issue_select',
+        label: { type: 'plain_text', text: 'Issue' },
+        element: {
+          type: 'static_select',
+          action_id: 'value',
+          placeholder: { type: 'plain_text', text: 'Select an issue...' },
+          options,
+        },
+      },
+    ],
+  };
+
+  const resp = await fetch('https://slack.com/api/views.open', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${env.SLACK_BOT_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ trigger_id: triggerId, view: modal }),
+  });
+  const data = await resp.json();
+  if (!data.ok) throw new Error(`views.open failed: ${data.error}`);
+}
+
 async function openClaimModal(triggerId, issues, channelId, userId, env) {
   const storedGhUser = await env.TICKET_STORE.get(`github_user:${userId}`) || '';
 
@@ -231,6 +276,26 @@ async function handleSlashCommand(request, env) {
       return ok();
     }
 
+    case '/abandon': {
+      const work = async () => {
+        try {
+          const { keys } = await env.TICKET_STORE.list({ prefix: 'claim:' });
+          const all = await Promise.all(keys.map(k => env.TICKET_STORE.get(k.name, 'json')));
+          const mine = all.filter(c => c && c.userId === userId);
+          if (mine.length === 0) {
+            await postEphemeral(channelId, userId, "You don't have any claimed issues to abandon.", env);
+            return;
+          }
+          await openAbandonModal(triggerId, mine, channelId, env);
+        } catch (e) {
+          console.error('/abandon error:', e);
+          await postEphemeral(channelId, userId, `Failed to load your issues: ${e.message}`, env);
+        }
+      };
+      if (typeof env._ctx?.waitUntil === 'function') env._ctx.waitUntil(work());
+      return ok();
+    }
+
     case '/tickets': {
       const { keys } = await env.TICKET_STORE.list({ prefix: 'claim:' });
       if (keys.length === 0) {
@@ -269,6 +334,37 @@ async function handleInteraction(request, env) {
 
   if (payload.type === 'view_submission') {
     const callbackId = payload.view?.callback_id;
+
+    if (callbackId === 'abandon_issue') {
+      const userId = payload.user?.id;
+      const issueNumber = payload.view?.state?.values?.issue_select?.value?.selected_option?.value;
+      let meta = {};
+      try { meta = JSON.parse(payload.view?.private_metadata || '{}'); } catch {}
+      const channelId = meta.channel_id || userId;
+
+      const work = async () => {
+        try {
+          const claim = await env.TICKET_STORE.get(`claim:${issueNumber}`, 'json');
+          const githubUsername = claim?.githubUsername || null;
+
+          await env.TICKET_STORE.delete(`claim:${issueNumber}`);
+
+          if (githubUsername) {
+            await triggerWorkflow('abandon.yml', env, {
+              issue_number: issueNumber,
+              github_username: githubUsername,
+              slack_user_id: userId,
+              slack_channel_id: channelId,
+            });
+          }
+        } catch (e) {
+          console.error('abandon_issue submission error:', e);
+          await postMessage(userId, `❌ Failed to abandon issue: ${e.message}`, env);
+        }
+      };
+      if (typeof env._ctx?.waitUntil === 'function') env._ctx.waitUntil(work());
+      return ok();
+    }
 
     if (callbackId === 'claim_issue') {
       const userId = payload.user?.id;
