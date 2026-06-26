@@ -55,7 +55,11 @@ func main() {
 }
 
 func unassignIssue(repo, number, username, token string) error {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/issues/%s/assignees", repo, number)
+	return unassignIssueWithBase("https://api.github.com", repo, number, username, token)
+}
+
+func unassignIssueWithBase(baseURL, repo, number, username, token string) error {
+	url := fmt.Sprintf("%s/repos/%s/issues/%s/assignees", baseURL, repo, number)
 	body, _ := json.Marshal(map[string][]string{"assignees": {username}})
 
 	req, err := http.NewRequest("DELETE", url, bytes.NewReader(body))

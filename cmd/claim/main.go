@@ -55,7 +55,11 @@ func main() {
 }
 
 func assignIssue(repo, number, username, token string) error {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/issues/%s/assignees", repo, number)
+	return assignIssueWithBase("https://api.github.com", repo, number, username, token)
+}
+
+func assignIssueWithBase(baseURL, repo, number, username, token string) error {
+	url := fmt.Sprintf("%s/repos/%s/issues/%s/assignees", baseURL, repo, number)
 	body, _ := json.Marshal(map[string][]string{"assignees": {username}})
 
 	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
