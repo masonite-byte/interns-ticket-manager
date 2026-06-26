@@ -47,6 +47,25 @@ async function verifySlackSignature(request, body, signingSecret) {
 
 // ── GitHub helpers ────────────────────────────────────────────────────────────
 
+async function triggerWorkflow(workflowFile, env, inputs = {}) {
+  const url = `https://api.github.com/repos/${env.GITHUB_REPO}/actions/workflows/${workflowFile}/dispatches`;
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
+      'Accept': 'application/vnd.github+json',
+      'Content-Type': 'application/json',
+      'User-Agent': 'interns-ticket-manager',
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+    body: JSON.stringify({ ref: 'main', inputs }),
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`GitHub API ${resp.status}: ${text}`);
+  }
+}
+
 function ghHeaders(env) {
   return {
     'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
@@ -272,21 +291,6 @@ async function handleInteraction(request, env) {
           if (!issueResp.ok) throw new Error(`GitHub API ${issueResp.status}`);
           const issue = await issueResp.json();
 
-          if (githubUsername) {
-            const assignResp = await fetch(
-              `https://api.github.com/repos/${env.GITHUB_REPO}/issues/${issueNumber}/assignees`,
-              {
-                method: 'POST',
-                headers: { ...ghHeaders(env), 'Content-Type': 'application/json' },
-                body: JSON.stringify({ assignees: [githubUsername] }),
-              },
-            );
-            if (!assignResp.ok) {
-              const text = await assignResp.text();
-              console.error(`Failed to assign issue: ${assignResp.status}: ${text}`);
-            }
-          }
-
           await env.TICKET_STORE.put(`claim:${issueNumber}`, JSON.stringify({
             userId,
             githubUsername: githubUsername || null,
@@ -296,7 +300,13 @@ async function handleInteraction(request, env) {
             claimedAt: new Date().toISOString(),
           }));
 
-          await postMessage(userId, `✅ You claimed *#${issueNumber}: ${issue.title}*\n${issue.html_url}`, env);
+          if (githubUsername) {
+            await triggerWorkflow('claim.yml', env, {
+              issue_number: issueNumber,
+              github_username: githubUsername,
+              slack_user_id: userId,
+            });
+          }
         } catch (e) {
           console.error('claim_issue submission error:', e);
           await postMessage(userId, `❌ Failed to claim issue: ${e.message}`, env);

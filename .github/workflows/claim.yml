@@ -1,0 +1,35 @@
+name: Claim Issue
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'GitHub issue number to assign'
+        required: true
+      github_username:
+        description: 'GitHub username to assign to'
+        required: true
+      slack_user_id:
+        description: 'Slack user ID to notify on completion'
+        required: false
+        default: ''
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - run: go run ./cmd/claim
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          GITHUB_USERNAME: ${{ inputs.github_username }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_USER_ID: ${{ inputs.slack_user_id }}
