@@ -54,7 +54,7 @@ func main() {
 		}
 
 		if slackChannelID != "" {
-			announcement := fmt.Sprintf("<@%s> abandoned issue #%s — it's unclaimed again.", slackUserID, issueNumber)
+			announcement := fmt.Sprintf(":not_stonks: <@%s> abandoned issue #%s — it's unclaimed again.", slackUserID, issueNumber)
 			if _, _, err := client.PostMessage(slackChannelID, slack.MsgOptionText(announcement, false)); err != nil {
 				slog.Error("failed to post to channel", "error", err)
 			}

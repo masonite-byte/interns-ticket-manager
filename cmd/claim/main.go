@@ -53,7 +53,7 @@ func main() {
 		}
 
 		if slackChannelID != "" {
-			announcement := fmt.Sprintf("<@%s> claimed issue #%s and has been assigned on GitHub.", slackUserID, issueNumber)
+			announcement := fmt.Sprintf(":stonks: <@%s> claimed issue #%s and has been assigned on GitHub.", slackUserID, issueNumber)
 			if _, _, err := client.PostMessage(slackChannelID, slack.MsgOptionText(announcement, false)); err != nil {
 				slog.Error("failed to post to channel", "error", err)
 			}

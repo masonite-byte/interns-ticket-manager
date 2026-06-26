@@ -468,10 +468,6 @@ async function handleInteraction(request, env) {
           await env.TICKET_STORE.delete(`claim:${issueNumber}`);
           await incrementStat(userId, 'abandoned', env.TICKET_STORE);
 
-          await postMessage(channelId, 'not stonks', env, {
-            blocks: [{ type: 'image', image_url: 'https://media.tenor.com/Xm5q3IZIEd4AAAAd/not-stonks-profit-down.gif', alt_text: 'not stonks' }],
-          });
-
           if (githubUsername) {
             await triggerWorkflow('abandon.yml', env, {
               issue_number: issueNumber,
@@ -521,10 +517,6 @@ async function handleInteraction(request, env) {
           }));
 
           await incrementStat(userId, 'claimed', env.TICKET_STORE);
-
-          await postMessage(channelId, 'stonks', env, {
-            blocks: [{ type: 'image', image_url: 'https://media2.giphy.com/media/v1.Y2lkPTZjMDliOTUydmVxMjc4ZDloY2RwNDR1d2x4djM4YmZxcW1pOGZ1cTA5YXc2aDNkaCZlcD12MV9naWZzX3NlYXJjaCZjdD1n/YnkMcHgNIMW4Yfmjxr/giphy.gif', alt_text: 'stonks' }],
-          });
 
           if (githubUsername) {
             await triggerWorkflow('claim.yml', env, {
