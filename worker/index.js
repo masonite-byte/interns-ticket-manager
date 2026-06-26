@@ -605,7 +605,6 @@ async function handleGitHubWebhook(request, env) {
   const pr = payload.pull_request;
   const prUrl = pr.html_url;
   const prTitle = pr.title;
-  const prAuthor = pr.user.login;
   const issueNumbers = extractClosedIssues(pr.body);
 
   if (issueNumbers.length === 0) return ok();
