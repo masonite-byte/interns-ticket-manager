@@ -1,4 +1,4 @@
-import { extractClosedIssues, verifySlackSignature, verifyGitHubSignature } from './utils.js';
+import { extractClosedIssues, verifySlackSignature, verifyGitHubSignature, parseSlackMention, incrementStat } from './utils.js';
 
 const HELP_TEXT = [
   'Supported slash commands:',
@@ -69,15 +69,6 @@ async function fetchUnclaimedIssues(env) {
   return issues
     .filter(i => !i.pull_request && !claimedNumbers.has(String(i.number)))
     .slice(0, 10);
-}
-
-// ── KV stats helpers ──────────────────────────────────────────────────────────
-
-async function incrementStat(userId, field, env) {
-  const key = `stats:${userId}`;
-  const stats = (await env.TICKET_STORE.get(key, 'json')) || { claimed: 0, closed: 0, abandoned: 0 };
-  stats[field] = (stats[field] || 0) + 1;
-  await env.TICKET_STORE.put(key, JSON.stringify(stats));
 }
 
 // ── Slack API helpers ─────────────────────────────────────────────────────────
@@ -356,8 +347,7 @@ async function handleSlashCommand(request, env) {
     }
 
     case '/whois': {
-      const match = text.match(/<@([A-Z0-9]+)/);
-      const targetId = match ? match[1] : userId;
+      const targetId = parseSlackMention(text) || userId;
 
       const { keys } = await env.TICKET_STORE.list({ prefix: 'claim:' });
       const all = await Promise.all(keys.map(k => env.TICKET_STORE.get(k.name, 'json')));
@@ -452,7 +442,7 @@ async function handleInteraction(request, env) {
           const githubUsername = claim?.githubUsername || null;
 
           await env.TICKET_STORE.delete(`claim:${issueNumber}`);
-          await incrementStat(userId, 'abandoned', env);
+          await incrementStat(userId, 'abandoned', env.TICKET_STORE);
 
           if (githubUsername) {
             await triggerWorkflow('abandon.yml', env, {
@@ -502,7 +492,7 @@ async function handleInteraction(request, env) {
             claimedAt: new Date().toISOString(),
           }));
 
-          await incrementStat(userId, 'claimed', env);
+          await incrementStat(userId, 'claimed', env.TICKET_STORE);
 
           if (githubUsername) {
             await triggerWorkflow('claim.yml', env, {
@@ -596,7 +586,7 @@ async function handleGitHubWebhook(request, env) {
           env,
         );
         await env.TICKET_STORE.delete(`claim:${num}`);
-        await incrementStat(claim.userId, 'closed', env);
+        await incrementStat(claim.userId, 'closed', env.TICKET_STORE);
       }
     }
   };
