@@ -5,6 +5,7 @@ compatibility_date = "2026-06-26"
 [vars]
 ADMIN_USER_ID = "U0B9YUFNMJB"
 GITHUB_REPO = "masonite-byte/interns-ticket-manager"
+SLACK_CHANNEL_ID = "C0BACATB8BY"
 
 [[kv_namespaces]]
 binding = "TICKET_STORE"

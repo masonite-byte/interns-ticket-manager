@@ -1,7 +1,12 @@
+import { extractClosedIssues, verifySlackSignature, verifyGitHubSignature } from './utils.js';
+
 const HELP_TEXT = [
   'Supported slash commands:',
   '/claim     - pick an unclaimed issue to work on.',
   '/abandon   - drop an issue you previously claimed.',
+  '/progress  - post a status update on one of your claimed issues.',
+  '/whois     - see what issues someone has claimed.',
+  '/stats     - show the leaderboard.',
   '/tickets   - show all currently claimed tickets.',
   '/ping      - check that the bot is alive.',
   '/help      - show this help text.',
@@ -15,36 +20,9 @@ const ABOUT_TEXT = [
   'Capabilities:',
   '• Tracks tickets interns forget to mark as in-progress',
   '• Lets interns claim open GitHub issues from Slack',
+  '• Posts channel announcements when PRs are opened or merged',
   '• Runs on Cloudflare because servers cost money',
 ].join('\n');
-
-// ── Signature verification ────────────────────────────────────────────────────
-
-async function verifySlackSignature(request, body, signingSecret) {
-  const timestamp = request.headers.get('X-Slack-Request-Timestamp');
-  const slackSig = request.headers.get('X-Slack-Signature');
-  if (!timestamp || !slackSig) return false;
-
-  if (Math.abs(Date.now() / 1000 - parseInt(timestamp, 10)) > 300) return false;
-
-  const key = await crypto.subtle.importKey(
-    'raw',
-    new TextEncoder().encode(signingSecret),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign'],
-  );
-  const raw = await crypto.subtle.sign(
-    'HMAC',
-    key,
-    new TextEncoder().encode(`v0:${timestamp}:${body}`),
-  );
-  const computed = 'v0=' + Array.from(new Uint8Array(raw))
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
-
-  return computed === slackSig;
-}
 
 // ── GitHub helpers ────────────────────────────────────────────────────────────
 
@@ -93,6 +71,15 @@ async function fetchUnclaimedIssues(env) {
     .slice(0, 10);
 }
 
+// ── KV stats helpers ──────────────────────────────────────────────────────────
+
+async function incrementStat(userId, field, env) {
+  const key = `stats:${userId}`;
+  const stats = (await env.TICKET_STORE.get(key, 'json')) || { claimed: 0, closed: 0, abandoned: 0 };
+  stats[field] = (stats[field] || 0) + 1;
+  await env.TICKET_STORE.put(key, JSON.stringify(stats));
+}
+
 // ── Slack API helpers ─────────────────────────────────────────────────────────
 
 async function postMessage(channelId, text, env, extra = {}) {
@@ -116,50 +103,6 @@ async function postEphemeral(channelId, userId, text, env) {
     },
     body: JSON.stringify({ channel: channelId, user: userId, text }),
   });
-}
-
-async function openAbandonModal(triggerId, claims, channelId, env) {
-  const options = claims.map(claim => ({
-    text: { type: 'plain_text', text: `#${claim.issueNumber} ${claim.issueTitle}`.slice(0, 75) },
-    value: String(claim.issueNumber),
-  }));
-
-  const modal = {
-    type: 'modal',
-    callback_id: 'abandon_issue',
-    private_metadata: JSON.stringify({ channel_id: channelId }),
-    title: { type: 'plain_text', text: 'Abandon an Issue' },
-    submit: { type: 'plain_text', text: 'Abandon' },
-    close: { type: 'plain_text', text: 'Cancel' },
-    blocks: [
-      {
-        type: 'section',
-        text: { type: 'mrkdwn', text: 'Pick an issue to drop. It will be unassigned on GitHub and back in the pool.' },
-      },
-      {
-        type: 'input',
-        block_id: 'issue_select',
-        label: { type: 'plain_text', text: 'Issue' },
-        element: {
-          type: 'static_select',
-          action_id: 'value',
-          placeholder: { type: 'plain_text', text: 'Select an issue...' },
-          options,
-        },
-      },
-    ],
-  };
-
-  const resp = await fetch('https://slack.com/api/views.open', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${env.SLACK_BOT_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ trigger_id: triggerId, view: modal }),
-  });
-  const data = await resp.json();
-  if (!data.ok) throw new Error(`views.open failed: ${data.error}`);
 }
 
 async function openClaimModal(triggerId, issues, channelId, userId, env) {
@@ -220,6 +163,101 @@ async function openClaimModal(triggerId, issues, channelId, userId, env) {
   if (!data.ok) throw new Error(`views.open failed: ${data.error}`);
 }
 
+async function openAbandonModal(triggerId, claims, channelId, env) {
+  const options = claims.map(claim => ({
+    text: { type: 'plain_text', text: `#${claim.issueNumber} ${claim.issueTitle}`.slice(0, 75) },
+    value: String(claim.issueNumber),
+  }));
+
+  const modal = {
+    type: 'modal',
+    callback_id: 'abandon_issue',
+    private_metadata: JSON.stringify({ channel_id: channelId }),
+    title: { type: 'plain_text', text: 'Abandon an Issue' },
+    submit: { type: 'plain_text', text: 'Abandon' },
+    close: { type: 'plain_text', text: 'Cancel' },
+    blocks: [
+      {
+        type: 'section',
+        text: { type: 'mrkdwn', text: 'Pick an issue to drop. It will be unassigned on GitHub and back in the pool.' },
+      },
+      {
+        type: 'input',
+        block_id: 'issue_select',
+        label: { type: 'plain_text', text: 'Issue' },
+        element: {
+          type: 'static_select',
+          action_id: 'value',
+          placeholder: { type: 'plain_text', text: 'Select an issue...' },
+          options,
+        },
+      },
+    ],
+  };
+
+  const resp = await fetch('https://slack.com/api/views.open', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${env.SLACK_BOT_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ trigger_id: triggerId, view: modal }),
+  });
+  const data = await resp.json();
+  if (!data.ok) throw new Error(`views.open failed: ${data.error}`);
+}
+
+async function openProgressModal(triggerId, claims, channelId, env) {
+  const options = claims.map(claim => ({
+    text: { type: 'plain_text', text: `#${claim.issueNumber} ${claim.issueTitle}`.slice(0, 75) },
+    value: String(claim.issueNumber),
+  }));
+
+  const modal = {
+    type: 'modal',
+    callback_id: 'post_progress',
+    private_metadata: JSON.stringify({ channel_id: channelId }),
+    title: { type: 'plain_text', text: 'Post an Update' },
+    submit: { type: 'plain_text', text: 'Post' },
+    close: { type: 'plain_text', text: 'Cancel' },
+    blocks: [
+      {
+        type: 'input',
+        block_id: 'issue_select',
+        label: { type: 'plain_text', text: 'Issue' },
+        element: {
+          type: 'static_select',
+          action_id: 'value',
+          placeholder: { type: 'plain_text', text: 'Select an issue...' },
+          options,
+        },
+      },
+      {
+        type: 'input',
+        block_id: 'update_text',
+        label: { type: 'plain_text', text: 'Update' },
+        element: {
+          type: 'plain_text_input',
+          action_id: 'value',
+          multiline: true,
+          placeholder: { type: 'plain_text', text: 'e.g. Almost done — just need to add tests.' },
+        },
+      },
+    ],
+  };
+
+  const resp = await fetch('https://slack.com/api/views.open', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${env.SLACK_BOT_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ trigger_id: triggerId, view: modal }),
+  });
+  const data = await resp.json();
+  if (!data.ok) throw new Error(`views.open failed: ${data.error}`);
+}
+
 // ── Response helpers ──────────────────────────────────────────────────────────
 
 function ephemeral(text, status = 200) {
@@ -244,6 +282,7 @@ async function handleSlashCommand(request, env) {
 
   const params = new URLSearchParams(body);
   const command = params.get('command') || '';
+  const text = (params.get('text') || '').trim();
   const userId = params.get('user_id') || '';
   const channelId = params.get('channel_id') || '';
   const triggerId = params.get('trigger_id') || '';
@@ -294,6 +333,71 @@ async function handleSlashCommand(request, env) {
       };
       if (typeof env._ctx?.waitUntil === 'function') env._ctx.waitUntil(work());
       return ok();
+    }
+
+    case '/progress': {
+      const work = async () => {
+        try {
+          const { keys } = await env.TICKET_STORE.list({ prefix: 'claim:' });
+          const all = await Promise.all(keys.map(k => env.TICKET_STORE.get(k.name, 'json')));
+          const mine = all.filter(c => c && c.userId === userId);
+          if (mine.length === 0) {
+            await postEphemeral(channelId, userId, "You don't have any claimed issues to update.", env);
+            return;
+          }
+          await openProgressModal(triggerId, mine, channelId, env);
+        } catch (e) {
+          console.error('/progress error:', e);
+          await postEphemeral(channelId, userId, `Failed to load your issues: ${e.message}`, env);
+        }
+      };
+      if (typeof env._ctx?.waitUntil === 'function') env._ctx.waitUntil(work());
+      return ok();
+    }
+
+    case '/whois': {
+      const match = text.match(/<@([A-Z0-9]+)/);
+      const targetId = match ? match[1] : userId;
+
+      const { keys } = await env.TICKET_STORE.list({ prefix: 'claim:' });
+      const all = await Promise.all(keys.map(k => env.TICKET_STORE.get(k.name, 'json')));
+      const theirs = all.filter(c => c && c.userId === targetId);
+
+      if (theirs.length === 0) {
+        const msg = targetId === userId
+          ? "You don't have any claimed issues."
+          : `<@${targetId}> doesn't have any claimed issues.`;
+        return ephemeral(msg);
+      }
+
+      const lines = [`*Issues claimed by <@${targetId}>:*`];
+      for (const claim of theirs) {
+        lines.push(`• #${claim.issueNumber} *${claim.issueTitle}* — <${claim.issueUrl}|view>`);
+      }
+      return ephemeral(lines.join('\n'));
+    }
+
+    case '/stats': {
+      const { keys } = await env.TICKET_STORE.list({ prefix: 'stats:' });
+      if (keys.length === 0) {
+        return ephemeral('No stats yet — get to work! 💪');
+      }
+
+      const allStats = await Promise.all(keys.map(async k => {
+        const uid = k.name.replace('stats:', '');
+        const s = (await env.TICKET_STORE.get(k.name, 'json')) || {};
+        return { uid, claimed: s.claimed || 0, closed: s.closed || 0, abandoned: s.abandoned || 0 };
+      }));
+
+      allStats.sort((a, b) => b.closed - a.closed || b.claimed - a.claimed);
+
+      const medals = ['🥇', '🥈', '🥉'];
+      const lines = ['📊 *Intern Stats*', ''];
+      allStats.forEach((s, i) => {
+        const medal = medals[i] || '•';
+        lines.push(`${medal} <@${s.uid}> — ${s.closed} closed, ${s.claimed} claimed, ${s.abandoned} abandoned`);
+      });
+      return ephemeral(lines.join('\n'));
     }
 
     case '/tickets': {
@@ -348,6 +452,7 @@ async function handleInteraction(request, env) {
           const githubUsername = claim?.githubUsername || null;
 
           await env.TICKET_STORE.delete(`claim:${issueNumber}`);
+          await incrementStat(userId, 'abandoned', env);
 
           if (githubUsername) {
             await triggerWorkflow('abandon.yml', env, {
@@ -393,8 +498,11 @@ async function handleInteraction(request, env) {
             issueNumber: parseInt(issueNumber, 10),
             issueTitle: issue.title,
             issueUrl: issue.html_url,
+            channelId,
             claimedAt: new Date().toISOString(),
           }));
+
+          await incrementStat(userId, 'claimed', env);
 
           if (githubUsername) {
             await triggerWorkflow('claim.yml', env, {
@@ -412,8 +520,88 @@ async function handleInteraction(request, env) {
       if (typeof env._ctx?.waitUntil === 'function') env._ctx.waitUntil(work());
       return ok();
     }
+
+    if (callbackId === 'post_progress') {
+      const userId = payload.user?.id;
+      const issueNumber = payload.view?.state?.values?.issue_select?.value?.selected_option?.value;
+      const updateText = payload.view?.state?.values?.update_text?.value?.value?.trim();
+      let meta = {};
+      try { meta = JSON.parse(payload.view?.private_metadata || '{}'); } catch {}
+      const channelId = meta.channel_id || env.SLACK_CHANNEL_ID;
+
+      const work = async () => {
+        try {
+          const claim = await env.TICKET_STORE.get(`claim:${issueNumber}`, 'json');
+          const title = claim?.issueTitle || `#${issueNumber}`;
+          const url = claim?.issueUrl || '';
+
+          const msg = [
+            `📝 *Update from <@${userId}>* on <${url}|#${issueNumber}: ${title}>`,
+            updateText,
+          ].join('\n');
+
+          await postMessage(channelId, msg, env);
+        } catch (e) {
+          console.error('post_progress submission error:', e);
+          await postMessage(userId, `❌ Failed to post update: ${e.message}`, env);
+        }
+      };
+      if (typeof env._ctx?.waitUntil === 'function') env._ctx.waitUntil(work());
+      return ok();
+    }
   }
 
+  return ok();
+}
+
+// ── GitHub webhook handler ────────────────────────────────────────────────────
+
+async function handleGitHubWebhook(request, env) {
+  const body = await request.text();
+
+  if (!await verifyGitHubSignature(request, body, env.GITHUB_WEBHOOK_SECRET)) {
+    return new Response('Unauthorized', { status: 401 });
+  }
+
+  const event = request.headers.get('X-GitHub-Event');
+  if (event !== 'pull_request') return ok();
+
+  const payload = JSON.parse(body);
+  const action = payload.action;
+  const pr = payload.pull_request;
+  const prUrl = pr.html_url;
+  const prTitle = pr.title;
+  const prAuthor = pr.user.login;
+  const issueNumbers = extractClosedIssues(pr.body);
+
+  if (issueNumbers.length === 0) return ok();
+
+  const work = async () => {
+    for (const num of issueNumbers) {
+      const claim = await env.TICKET_STORE.get(`claim:${num}`, 'json');
+      if (!claim) continue;
+
+      const channel = claim.channelId || env.SLACK_CHANNEL_ID;
+
+      if (action === 'opened') {
+        await postMessage(channel,
+          `🔀 <@${claim.userId}> opened a PR for <${claim.issueUrl}|#${num}: ${claim.issueTitle}>\n<${prUrl}|${prTitle}>`,
+          env,
+        );
+      }
+
+      if (action === 'closed' && pr.merged) {
+        await postMessage(channel,
+          `🎉 <@${claim.userId}> merged a PR and closed <${claim.issueUrl}|#${num}: ${claim.issueTitle}> — nice work!\n<${prUrl}|${prTitle}>`,
+          env,
+        );
+        await env.TICKET_STORE.delete(`claim:${num}`);
+        await incrementStat(claim.userId, 'closed', env);
+      }
+    }
+  };
+
+  if (typeof env._ctx?.waitUntil === 'function') env._ctx.waitUntil(work());
   return ok();
 }
 
@@ -431,6 +619,10 @@ export default {
 
     if (request.method === 'POST' && url.pathname === '/slack/interactions') {
       return handleInteraction(request, env);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/github/webhook') {
+      return handleGitHubWebhook(request, env);
     }
 
     return new Response('Not found', { status: 404 });
