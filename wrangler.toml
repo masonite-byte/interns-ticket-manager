@@ -1,0 +1,11 @@
+name = "interns-ticket-manager"
+main = "worker/index.js"
+compatibility_date = "2026-06-26"
+
+[vars]
+ADMIN_USER_ID = "U0B9YUFNMJB"
+GITHUB_REPO = "masonite-byte/interns-ticket-manager"
+
+[[kv_namespaces]]
+binding = "TICKET_STORE"
+id = ""
