@@ -70,3 +70,111 @@ func TestUnassignIssue_SetsAuthHeader(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestDeleteClaimComment_FindsAndDeletes(t *testing.T) {
+	var deletedID string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/repos/owner/repo/issues/42/comments":
+			comments := []map[string]interface{}{
+				{"id": 1001, "body": "some other comment"},
+				{"id": 1002, "body": "@testuser is working on this."},
+			}
+			json.NewEncoder(w).Encode(comments)
+
+		case r.Method == "DELETE" && r.URL.Path == "/repos/owner/repo/issues/comments/1002":
+			deletedID = "1002"
+			w.WriteHeader(http.StatusNoContent)
+
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer srv.Close()
+
+	if err := deleteClaimCommentWithBase(srv.URL, "owner/repo", "42", "testuser", "token"); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if deletedID != "1002" {
+		t.Errorf("expected comment 1002 to be deleted, got %q", deletedID)
+	}
+}
+
+func TestDeleteClaimComment_NoComment(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			comments := []map[string]interface{}{
+				{"id": 1001, "body": "unrelated comment"},
+			}
+			json.NewEncoder(w).Encode(comments)
+			return
+		}
+		t.Errorf("unexpected DELETE — should not delete when comment not found")
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	if err := deleteClaimCommentWithBase(srv.URL, "owner/repo", "42", "nobody", "token"); err != nil {
+		t.Fatalf("expected no error for missing comment, got %v", err)
+	}
+}
+
+func TestDeleteClaimComment_DeleteFails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			comments := []map[string]interface{}{
+				{"id": 999, "body": "@testuser is working on this."},
+			}
+			json.NewEncoder(w).Encode(comments)
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+
+	err := deleteClaimCommentWithBase(srv.URL, "owner/repo", "42", "testuser", "token")
+	if err == nil {
+		t.Fatal("expected error when delete returns 403, got nil")
+	}
+}
+
+func TestRemoveLabel_Success(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "DELETE" {
+			t.Errorf("expected DELETE, got %s", r.Method)
+		}
+		if r.URL.Path != "/repos/owner/repo/issues/42/labels/in-progress" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	if err := removeLabelWithBase(srv.URL, "owner/repo", "42", "token"); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestRemoveLabel_NotFoundIsOk(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	if err := removeLabelWithBase(srv.URL, "owner/repo", "42", "token"); err != nil {
+		t.Fatalf("expected no error for 404 (label not on issue), got %v", err)
+	}
+}
+
+func TestRemoveLabel_ServerError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	err := removeLabelWithBase(srv.URL, "owner/repo", "42", "token")
+	if err == nil {
+		t.Fatal("expected error for 500, got nil")
+	}
+}

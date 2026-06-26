@@ -390,6 +390,30 @@ async function handleSlashCommand(request, env) {
       return ephemeral(lines.join('\n'));
     }
 
+    case '/standup': {
+      const { keys } = await env.TICKET_STORE.list({ prefix: 'claim:' });
+      if (keys.length === 0) {
+        return ephemeral('No tickets are currently claimed. 🎉');
+      }
+      const claims = (await Promise.all(keys.map(k => env.TICKET_STORE.get(k.name, 'json')))).filter(Boolean);
+
+      const byUser = {};
+      for (const claim of claims) {
+        if (!byUser[claim.userId]) byUser[claim.userId] = [];
+        byUser[claim.userId].push(claim);
+      }
+
+      const lines = ['📋 *Standup Summary*', ''];
+      for (const [uid, userClaims] of Object.entries(byUser)) {
+        lines.push(`<@${uid}>:`);
+        for (const claim of userClaims) {
+          lines.push(`  • #${claim.issueNumber} *${claim.issueTitle}* — <${claim.issueUrl}|view>`);
+        }
+        lines.push('');
+      }
+      return ephemeral(lines.join('\n').trimEnd());
+    }
+
     case '/tickets': {
       const { keys } = await env.TICKET_STORE.list({ prefix: 'claim:' });
       if (keys.length === 0) {
@@ -525,6 +549,13 @@ async function handleInteraction(request, env) {
           const title = claim?.issueTitle || `#${issueNumber}`;
           const url = claim?.issueUrl || '';
 
+          if (claim) {
+            await env.TICKET_STORE.put(`claim:${issueNumber}`, JSON.stringify({
+              ...claim,
+              lastProgressAt: new Date().toISOString(),
+            }));
+          }
+
           const msg = [
             `📝 *Update from <@${userId}>* on <${url}|#${issueNumber}: ${title}>`,
             updateText,
@@ -616,5 +647,29 @@ export default {
     }
 
     return new Response('Not found', { status: 404 });
+  },
+
+  async scheduled(event, env, ctx) {
+    const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+
+    const { keys } = await env.TICKET_STORE.list({ prefix: 'claim:' });
+    const claims = (await Promise.all(
+      keys.map(k => env.TICKET_STORE.get(k.name, 'json')),
+    )).filter(Boolean);
+
+    for (const claim of claims) {
+      const lastActivity = claim.lastProgressAt || claim.claimedAt;
+      if (!lastActivity) continue;
+
+      const ageMs = now - new Date(lastActivity).getTime();
+      if (ageMs >= THREE_DAYS_MS) {
+        await postMessage(
+          claim.userId,
+          `👋 Heads up — issue #${claim.issueNumber} *${claim.issueTitle}* hasn't had an update in 3+ days. Post a \`/progress\` update or \`/abandon\` if you're stepping away.`,
+          env,
+        );
+      }
+    }
   },
 };

@@ -32,8 +32,15 @@ func main() {
 		slog.Error("failed to assign issue", "error", err)
 		os.Exit(1)
 	}
-
 	slog.Info("assigned issue", "number", issueNumber, "user", githubUsername)
+
+	if err := postClaimComment(githubRepo, issueNumber, githubUsername, githubToken); err != nil {
+		slog.Warn("failed to post claim comment", "error", err)
+	}
+
+	if err := addLabel(githubRepo, issueNumber, githubToken); err != nil {
+		slog.Warn("failed to add in-progress label", "error", err)
+	}
 
 	if slackToken != "" {
 		client := slack.New(slackToken)
@@ -66,11 +73,7 @@ func assignIssueWithBase(baseURL, repo, number, username, token string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "interns-ticket-manager")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	setGitHubHeaders(req, token)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -82,4 +85,66 @@ func assignIssueWithBase(baseURL, repo, number, username, token string) error {
 		return fmt.Errorf("GitHub API returned %d", resp.StatusCode)
 	}
 	return nil
+}
+
+func postClaimComment(repo, number, githubUsername, token string) error {
+	return postClaimCommentWithBase("https://api.github.com", repo, number, githubUsername, token)
+}
+
+func postClaimCommentWithBase(baseURL, repo, number, githubUsername, token string) error {
+	url := fmt.Sprintf("%s/repos/%s/issues/%s/comments", baseURL, repo, number)
+	body, _ := json.Marshal(map[string]string{
+		"body": fmt.Sprintf("@%s is working on this.", githubUsername),
+	})
+
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	setGitHubHeaders(req, token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("GitHub API returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func addLabel(repo, number, token string) error {
+	return addLabelWithBase("https://api.github.com", repo, number, token)
+}
+
+func addLabelWithBase(baseURL, repo, number, token string) error {
+	url := fmt.Sprintf("%s/repos/%s/issues/%s/labels", baseURL, repo, number)
+	body, _ := json.Marshal(map[string][]string{"labels": {"in-progress"}})
+
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	setGitHubHeaders(req, token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("GitHub API returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func setGitHubHeaders(req *http.Request, token string) {
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "interns-ticket-manager")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 }

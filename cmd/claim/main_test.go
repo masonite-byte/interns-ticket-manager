@@ -70,3 +70,91 @@ func TestAssignIssue_SetsAuthHeader(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestPostClaimComment_Success(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if r.URL.Path != "/repos/owner/repo/issues/42/comments" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+
+		var body map[string]string
+		data, _ := io.ReadAll(r.Body)
+		json.Unmarshal(data, &body)
+		if body["body"] != "@testuser is working on this." {
+			t.Errorf("unexpected comment body: %q", body["body"])
+		}
+
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+
+	if err := postClaimCommentWithBase(srv.URL, "owner/repo", "42", "testuser", "token"); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestPostClaimComment_ServerError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	err := postClaimCommentWithBase(srv.URL, "owner/repo", "42", "testuser", "token")
+	if err == nil {
+		t.Fatal("expected error for 500, got nil")
+	}
+}
+
+func TestPostClaimComment_SetsAuthHeader(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer mytoken" {
+			t.Errorf("expected Bearer mytoken, got %s", r.Header.Get("Authorization"))
+		}
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+
+	if err := postClaimCommentWithBase(srv.URL, "owner/repo", "1", "user", "mytoken"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestAddLabel_Success(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if r.URL.Path != "/repos/owner/repo/issues/42/labels" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+
+		var body map[string][]string
+		data, _ := io.ReadAll(r.Body)
+		json.Unmarshal(data, &body)
+		if len(body["labels"]) != 1 || body["labels"][0] != "in-progress" {
+			t.Errorf("unexpected labels: %v", body["labels"])
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	if err := addLabelWithBase(srv.URL, "owner/repo", "42", "token"); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestAddLabel_ServerError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+	}))
+	defer srv.Close()
+
+	err := addLabelWithBase(srv.URL, "owner/repo", "42", "token")
+	if err == nil {
+		t.Fatal("expected error for 422, got nil")
+	}
+}

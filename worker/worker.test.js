@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import worker from './index.js';
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
@@ -247,5 +247,111 @@ describe('/stats', () => {
     const u2pos = json.text.indexOf('U2');
     const u1pos = json.text.indexOf('U1');
     expect(u2pos).toBeLessThan(u1pos);
+  });
+});
+
+// ── /standup ──────────────────────────────────────────────────────────────────
+
+describe('/standup', () => {
+  it('returns empty message when no tickets are claimed', async () => {
+    const env = makeEnv();
+    const body = 'command=%2Fstandup&user_id=U1&channel_id=C1&trigger_id=T1&text=';
+    const req = await signedSlackRequest('/slack/commands', body, env.SLACK_SIGNING_SECRET);
+    const res = await worker.fetch(req, env, ctx);
+    const json = await res.json();
+    expect(json.text).toContain('No tickets');
+  });
+
+  it('groups claims by user', async () => {
+    const env = makeEnv();
+    await env.TICKET_STORE.put('claim:1', JSON.stringify({
+      userId: 'U1', issueNumber: 1, issueTitle: 'Fix login', issueUrl: 'https://github.com/o/r/issues/1',
+    }));
+    await env.TICKET_STORE.put('claim:2', JSON.stringify({
+      userId: 'U2', issueNumber: 2, issueTitle: 'Add tests', issueUrl: 'https://github.com/o/r/issues/2',
+    }));
+    await env.TICKET_STORE.put('claim:3', JSON.stringify({
+      userId: 'U1', issueNumber: 3, issueTitle: 'Fix typo', issueUrl: 'https://github.com/o/r/issues/3',
+    }));
+    const body = 'command=%2Fstandup&user_id=U1&channel_id=C1&trigger_id=T1&text=';
+    const req = await signedSlackRequest('/slack/commands', body, env.SLACK_SIGNING_SECRET);
+    const res = await worker.fetch(req, env, ctx);
+    const json = await res.json();
+    expect(json.text).toContain('U1');
+    expect(json.text).toContain('Fix login');
+    expect(json.text).toContain('Fix typo');
+    expect(json.text).toContain('U2');
+    expect(json.text).toContain('Add tests');
+  });
+});
+
+// ── scheduled (staleness alerts) ─────────────────────────────────────────────
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe('scheduled', () => {
+  it('DMs users whose claims are older than 3 days', async () => {
+    const env = makeEnv();
+    const oldDate = new Date(Date.now() - 4 * 24 * 60 * 60 * 1000).toISOString();
+    await env.TICKET_STORE.put('claim:1', JSON.stringify({
+      userId: 'U1',
+      issueNumber: 1,
+      issueTitle: 'Old issue',
+      issueUrl: 'https://github.com/o/r/issues/1',
+      claimedAt: oldDate,
+    }));
+
+    const mockFetch = vi.fn().mockResolvedValue({ json: async () => ({ ok: true }) });
+    vi.stubGlobal('fetch', mockFetch);
+
+    await worker.scheduled({}, env, {});
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      'https://slack.com/api/chat.postMessage',
+      expect.objectContaining({ method: 'POST' }),
+    );
+    const callBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(callBody.channel).toBe('U1');
+    expect(callBody.text).toContain('Old issue');
+  });
+
+  it('does not DM users with fresh claims', async () => {
+    const env = makeEnv();
+    const recentDate = new Date(Date.now() - 1 * 24 * 60 * 60 * 1000).toISOString();
+    await env.TICKET_STORE.put('claim:1', JSON.stringify({
+      userId: 'U1',
+      issueNumber: 1,
+      issueTitle: 'Recent issue',
+      claimedAt: recentDate,
+    }));
+
+    const mockFetch = vi.fn();
+    vi.stubGlobal('fetch', mockFetch);
+
+    await worker.scheduled({}, env, {});
+
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('uses lastProgressAt over claimedAt when present', async () => {
+    const env = makeEnv();
+    const oldClaim = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+    const recentProgress = new Date(Date.now() - 1 * 24 * 60 * 60 * 1000).toISOString();
+    await env.TICKET_STORE.put('claim:1', JSON.stringify({
+      userId: 'U1',
+      issueNumber: 1,
+      issueTitle: 'Active issue',
+      claimedAt: oldClaim,
+      lastProgressAt: recentProgress,
+    }));
+
+    const mockFetch = vi.fn();
+    vi.stubGlobal('fetch', mockFetch);
+
+    await worker.scheduled({}, env, {});
+
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 });
