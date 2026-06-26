@@ -59,7 +59,7 @@ async function signedSlackRequest(path, body, secret, timestampOffset = 0) {
   });
 }
 
-async function signedGitHubRequest(path, body, secret) {
+async function signedGitHubRequest(path, body, secret, event = 'pull_request') {
   const key = await crypto.subtle.importKey(
     'raw', new TextEncoder().encode(secret),
     { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
@@ -72,7 +72,7 @@ async function signedGitHubRequest(path, body, secret) {
     headers: {
       'Content-Type': 'application/json',
       'X-Hub-Signature-256': sig,
-      'X-GitHub-Event': 'pull_request',
+      'X-GitHub-Event': event,
     },
     body,
   });
@@ -353,5 +353,58 @@ describe('scheduled', () => {
     await worker.scheduled({}, env, {});
 
     expect(mockFetch).not.toHaveBeenCalled();
+  });
+});
+
+// ── GitHub issues closed event ────────────────────────────────────────────────
+
+describe('GitHub issues closed webhook', () => {
+  it('deletes the claim when an issue is closed directly', async () => {
+    const env = makeEnv();
+    await env.TICKET_STORE.put('claim:42', JSON.stringify({
+      userId: 'U1', issueNumber: 42, issueTitle: 'Do a thing',
+    }));
+
+    const body = JSON.stringify({ action: 'closed', issue: { number: 42 } });
+    const req = await signedGitHubRequest('/github/webhook', body, env.GITHUB_WEBHOOK_SECRET, 'issues');
+    const res = await worker.fetch(req, env, ctx);
+
+    expect(res.status).toBe(200);
+    expect(env.TICKET_STORE._store.has('claim:42')).toBe(false);
+  });
+
+  it('increments the closed stat when an issue is closed directly', async () => {
+    const env = makeEnv();
+    await env.TICKET_STORE.put('claim:42', JSON.stringify({
+      userId: 'U1', issueNumber: 42, issueTitle: 'Do a thing',
+    }));
+
+    const body = JSON.stringify({ action: 'closed', issue: { number: 42 } });
+    const req = await signedGitHubRequest('/github/webhook', body, env.GITHUB_WEBHOOK_SECRET, 'issues');
+    await worker.fetch(req, env, ctx);
+
+    const stats = JSON.parse(env.TICKET_STORE._store.get('stats:U1'));
+    expect(stats.closed).toBe(1);
+  });
+
+  it('is a no-op when the closed issue has no claim', async () => {
+    const env = makeEnv();
+    const body = JSON.stringify({ action: 'closed', issue: { number: 99 } });
+    const req = await signedGitHubRequest('/github/webhook', body, env.GITHUB_WEBHOOK_SECRET, 'issues');
+    const res = await worker.fetch(req, env, ctx);
+    expect(res.status).toBe(200);
+  });
+
+  it('ignores non-closed issue actions', async () => {
+    const env = makeEnv();
+    await env.TICKET_STORE.put('claim:42', JSON.stringify({
+      userId: 'U1', issueNumber: 42, issueTitle: 'Do a thing',
+    }));
+
+    const body = JSON.stringify({ action: 'labeled', issue: { number: 42 } });
+    const req = await signedGitHubRequest('/github/webhook', body, env.GITHUB_WEBHOOK_SECRET, 'issues');
+    await worker.fetch(req, env, ctx);
+
+    expect(env.TICKET_STORE._store.has('claim:42')).toBe(true);
   });
 });

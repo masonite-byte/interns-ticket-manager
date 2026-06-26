@@ -585,10 +585,23 @@ async function handleGitHubWebhook(request, env) {
   }
 
   const event = request.headers.get('X-GitHub-Event');
-  if (event !== 'pull_request') return ok();
+  if (event !== 'pull_request' && event !== 'issues') return ok();
 
   const payload = JSON.parse(body);
   const action = payload.action;
+
+  if (event === 'issues') {
+    if (action === 'closed') {
+      const num = String(payload.issue.number);
+      const claim = await env.TICKET_STORE.get(`claim:${num}`, 'json');
+      if (claim) {
+        await env.TICKET_STORE.delete(`claim:${num}`);
+        await incrementStat(claim.userId, 'closed', env.TICKET_STORE);
+      }
+    }
+    return ok();
+  }
+
   const pr = payload.pull_request;
   const prUrl = pr.html_url;
   const prTitle = pr.title;
