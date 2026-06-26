@@ -469,7 +469,7 @@ async function handleInteraction(request, env) {
           await incrementStat(userId, 'abandoned', env.TICKET_STORE);
 
           await postMessage(channelId, '', env, {
-            attachments: [{ fallback: 'not stonks', image_url: 'https://raw.githubusercontent.com/masonite-byte/interns-ticket-manager/main/assets/not-stonks.png' }],
+            attachments: [{ fallback: 'not stonks', image_url: 'https://raw.githubusercontent.com/masonite-byte/interns-ticket-manager/main/Images/notStonks.png' }],
           });
 
           if (githubUsername) {
@@ -523,7 +523,7 @@ async function handleInteraction(request, env) {
           await incrementStat(userId, 'claimed', env.TICKET_STORE);
 
           await postMessage(channelId, '', env, {
-            attachments: [{ fallback: 'stonks', image_url: 'https://raw.githubusercontent.com/masonite-byte/interns-ticket-manager/main/assets/stonks.png' }],
+            attachments: [{ fallback: 'stonks', image_url: 'https://raw.githubusercontent.com/masonite-byte/interns-ticket-manager/main/Images/stonks.png' }],
           });
 
           if (githubUsername) {
