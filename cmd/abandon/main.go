@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -32,8 +33,15 @@ func main() {
 		slog.Error("failed to unassign issue", "error", err)
 		os.Exit(1)
 	}
-
 	slog.Info("unassigned issue", "number", issueNumber, "user", githubUsername)
+
+	if err := deleteClaimComment(githubRepo, issueNumber, githubUsername, githubToken); err != nil {
+		slog.Warn("failed to delete claim comment", "error", err)
+	}
+
+	if err := removeLabel(githubRepo, issueNumber, githubToken); err != nil {
+		slog.Warn("failed to remove in-progress label", "error", err)
+	}
 
 	if slackToken != "" {
 		client := slack.New(slackToken)
@@ -66,11 +74,7 @@ func unassignIssueWithBase(baseURL, repo, number, username, token string) error 
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "interns-ticket-manager")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	setGitHubHeaders(req, token)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -82,4 +86,98 @@ func unassignIssueWithBase(baseURL, repo, number, username, token string) error 
 		return fmt.Errorf("GitHub API returned %d", resp.StatusCode)
 	}
 	return nil
+}
+
+func deleteClaimComment(repo, number, githubUsername, token string) error {
+	return deleteClaimCommentWithBase("https://api.github.com", repo, number, githubUsername, token)
+}
+
+// deleteClaimCommentWithBase finds the "@username is working on this." comment
+// posted at claim time and deletes it. If the comment is not found, it's a no-op.
+func deleteClaimCommentWithBase(baseURL, repo, number, githubUsername, token string) error {
+	listURL := fmt.Sprintf("%s/repos/%s/issues/%s/comments?per_page=100", baseURL, repo, number)
+	req, err := http.NewRequest("GET", listURL, nil)
+	if err != nil {
+		return err
+	}
+	setGitHubHeaders(req, token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	var comments []struct {
+		ID   int64  `json:"id"`
+		Body string `json:"body"`
+	}
+	data, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(data, &comments); err != nil {
+		return err
+	}
+
+	target := fmt.Sprintf("@%s is working on this.", githubUsername)
+	var commentID int64
+	for _, c := range comments {
+		if c.Body == target {
+			commentID = c.ID
+			break
+		}
+	}
+
+	if commentID == 0 {
+		return nil
+	}
+
+	delURL := fmt.Sprintf("%s/repos/%s/issues/comments/%d", baseURL, repo, commentID)
+	delReq, err := http.NewRequest("DELETE", delURL, nil)
+	if err != nil {
+		return err
+	}
+	setGitHubHeaders(delReq, token)
+
+	delResp, err := http.DefaultClient.Do(delReq)
+	if err != nil {
+		return err
+	}
+	defer delResp.Body.Close()
+
+	if delResp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("GitHub API returned %d on comment delete", delResp.StatusCode)
+	}
+	return nil
+}
+
+func removeLabel(repo, number, token string) error {
+	return removeLabelWithBase("https://api.github.com", repo, number, token)
+}
+
+func removeLabelWithBase(baseURL, repo, number, token string) error {
+	url := fmt.Sprintf("%s/repos/%s/issues/%s/labels/in-progress", baseURL, repo, number)
+	req, err := http.NewRequest("DELETE", url, nil)
+	if err != nil {
+		return err
+	}
+	setGitHubHeaders(req, token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	// 404 means the label wasn't on the issue — not an error
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("GitHub API returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func setGitHubHeaders(req *http.Request, token string) {
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "interns-ticket-manager")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 }

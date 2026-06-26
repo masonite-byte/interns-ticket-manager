@@ -1,4 +1,4 @@
-import { extractClosedIssues, verifySlackSignature, verifyGitHubSignature } from './utils.js';
+import { extractClosedIssues, verifySlackSignature, verifyGitHubSignature, parseSlackMention, incrementStat } from './utils.js';
 
 const HELP_TEXT = [
   'Supported slash commands:',
@@ -69,15 +69,6 @@ async function fetchUnclaimedIssues(env) {
   return issues
     .filter(i => !i.pull_request && !claimedNumbers.has(String(i.number)))
     .slice(0, 10);
-}
-
-// ── KV stats helpers ──────────────────────────────────────────────────────────
-
-async function incrementStat(userId, field, env) {
-  const key = `stats:${userId}`;
-  const stats = (await env.TICKET_STORE.get(key, 'json')) || { claimed: 0, closed: 0, abandoned: 0 };
-  stats[field] = (stats[field] || 0) + 1;
-  await env.TICKET_STORE.put(key, JSON.stringify(stats));
 }
 
 // ── Slack API helpers ─────────────────────────────────────────────────────────
@@ -356,8 +347,7 @@ async function handleSlashCommand(request, env) {
     }
 
     case '/whois': {
-      const match = text.match(/<@([A-Z0-9]+)/);
-      const targetId = match ? match[1] : userId;
+      const targetId = parseSlackMention(text) || userId;
 
       const { keys } = await env.TICKET_STORE.list({ prefix: 'claim:' });
       const all = await Promise.all(keys.map(k => env.TICKET_STORE.get(k.name, 'json')));
@@ -398,6 +388,30 @@ async function handleSlashCommand(request, env) {
         lines.push(`${medal} <@${s.uid}> — ${s.closed} closed, ${s.claimed} claimed, ${s.abandoned} abandoned`);
       });
       return ephemeral(lines.join('\n'));
+    }
+
+    case '/standup': {
+      const { keys } = await env.TICKET_STORE.list({ prefix: 'claim:' });
+      if (keys.length === 0) {
+        return ephemeral('No tickets are currently claimed. 🎉');
+      }
+      const claims = (await Promise.all(keys.map(k => env.TICKET_STORE.get(k.name, 'json')))).filter(Boolean);
+
+      const byUser = {};
+      for (const claim of claims) {
+        if (!byUser[claim.userId]) byUser[claim.userId] = [];
+        byUser[claim.userId].push(claim);
+      }
+
+      const lines = ['📋 *Standup Summary*', ''];
+      for (const [uid, userClaims] of Object.entries(byUser)) {
+        lines.push(`<@${uid}>:`);
+        for (const claim of userClaims) {
+          lines.push(`  • #${claim.issueNumber} *${claim.issueTitle}* — <${claim.issueUrl}|view>`);
+        }
+        lines.push('');
+      }
+      return ephemeral(lines.join('\n').trimEnd());
     }
 
     case '/tickets': {
@@ -452,7 +466,7 @@ async function handleInteraction(request, env) {
           const githubUsername = claim?.githubUsername || null;
 
           await env.TICKET_STORE.delete(`claim:${issueNumber}`);
-          await incrementStat(userId, 'abandoned', env);
+          await incrementStat(userId, 'abandoned', env.TICKET_STORE);
 
           if (githubUsername) {
             await triggerWorkflow('abandon.yml', env, {
@@ -502,7 +516,7 @@ async function handleInteraction(request, env) {
             claimedAt: new Date().toISOString(),
           }));
 
-          await incrementStat(userId, 'claimed', env);
+          await incrementStat(userId, 'claimed', env.TICKET_STORE);
 
           if (githubUsername) {
             await triggerWorkflow('claim.yml', env, {
@@ -535,6 +549,13 @@ async function handleInteraction(request, env) {
           const title = claim?.issueTitle || `#${issueNumber}`;
           const url = claim?.issueUrl || '';
 
+          if (claim) {
+            await env.TICKET_STORE.put(`claim:${issueNumber}`, JSON.stringify({
+              ...claim,
+              lastProgressAt: new Date().toISOString(),
+            }));
+          }
+
           const msg = [
             `📝 *Update from <@${userId}>* on <${url}|#${issueNumber}: ${title}>`,
             updateText,
@@ -564,10 +585,23 @@ async function handleGitHubWebhook(request, env) {
   }
 
   const event = request.headers.get('X-GitHub-Event');
-  if (event !== 'pull_request') return ok();
+  if (event !== 'pull_request' && event !== 'issues') return ok();
 
   const payload = JSON.parse(body);
   const action = payload.action;
+
+  if (event === 'issues') {
+    if (action === 'closed') {
+      const num = String(payload.issue.number);
+      const claim = await env.TICKET_STORE.get(`claim:${num}`, 'json');
+      if (claim) {
+        await env.TICKET_STORE.delete(`claim:${num}`);
+        await incrementStat(claim.userId, 'closed', env.TICKET_STORE);
+      }
+    }
+    return ok();
+  }
+
   const pr = payload.pull_request;
   const prUrl = pr.html_url;
   const prTitle = pr.title;
@@ -596,7 +630,7 @@ async function handleGitHubWebhook(request, env) {
           env,
         );
         await env.TICKET_STORE.delete(`claim:${num}`);
-        await incrementStat(claim.userId, 'closed', env);
+        await incrementStat(claim.userId, 'closed', env.TICKET_STORE);
       }
     }
   };
@@ -626,5 +660,29 @@ export default {
     }
 
     return new Response('Not found', { status: 404 });
+  },
+
+  async scheduled(event, env, ctx) {
+    const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+
+    const { keys } = await env.TICKET_STORE.list({ prefix: 'claim:' });
+    const claims = (await Promise.all(
+      keys.map(k => env.TICKET_STORE.get(k.name, 'json')),
+    )).filter(Boolean);
+
+    for (const claim of claims) {
+      const lastActivity = claim.lastProgressAt || claim.claimedAt;
+      if (!lastActivity) continue;
+
+      const ageMs = now - new Date(lastActivity).getTime();
+      if (ageMs >= THREE_DAYS_MS) {
+        await postMessage(
+          claim.userId,
+          `👋 Heads up — issue #${claim.issueNumber} *${claim.issueTitle}* hasn't had an update in 3+ days. Post a \`/progress\` update or \`/abandon\` if you're stepping away.`,
+          env,
+        );
+      }
+    }
   },
 };

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { extractClosedIssues, verifySlackSignature, verifyGitHubSignature } from './utils.js';
+import { extractClosedIssues, verifySlackSignature, verifyGitHubSignature, parseSlackMention, incrementStat } from './utils.js';
 
 // ── extractClosedIssues ───────────────────────────────────────────────────────
 
@@ -145,5 +145,90 @@ describe('verifyGitHubSignature', () => {
   it('returns false when X-Hub-Signature-256 header is missing', async () => {
     const req = new Request('https://example.com', { method: 'POST' });
     expect(await verifyGitHubSignature(req, 'body', secret)).toBe(false);
+  });
+});
+
+// ── parseSlackMention ─────────────────────────────────────────────────────────
+
+describe('parseSlackMention', () => {
+  it('extracts a bare mention', () => {
+    expect(parseSlackMention('<@U123ABC>')).toBe('U123ABC');
+  });
+
+  it('extracts a mention with display name suffix', () => {
+    expect(parseSlackMention('<@U123ABC|mason>')).toBe('U123ABC');
+  });
+
+  it('extracts a mention embedded in surrounding text', () => {
+    expect(parseSlackMention('hello <@U999XYZ> there')).toBe('U999XYZ');
+  });
+
+  it('returns null for empty string', () => {
+    expect(parseSlackMention('')).toBeNull();
+  });
+
+  it('returns null when there is no mention', () => {
+    expect(parseSlackMention('just some text')).toBeNull();
+  });
+
+  it('returns null for null input', () => {
+    expect(parseSlackMention(null)).toBeNull();
+  });
+});
+
+// ── incrementStat ─────────────────────────────────────────────────────────────
+
+function makeKV() {
+  const store = new Map();
+  return {
+    get: async (key, type) => {
+      const val = store.get(key);
+      if (val === undefined) return null;
+      return type === 'json' ? JSON.parse(val) : val;
+    },
+    put: async (key, value) => store.set(key, value),
+    _store: store,
+  };
+}
+
+describe('incrementStat', () => {
+  it('initializes from zero on first increment', async () => {
+    const kv = makeKV();
+    await incrementStat('U1', 'claimed', kv);
+    const stats = JSON.parse(kv._store.get('stats:U1'));
+    expect(stats.claimed).toBe(1);
+    expect(stats.closed).toBe(0);
+    expect(stats.abandoned).toBe(0);
+  });
+
+  it('accumulates across multiple calls', async () => {
+    const kv = makeKV();
+    await incrementStat('U1', 'claimed', kv);
+    await incrementStat('U1', 'claimed', kv);
+    await incrementStat('U1', 'claimed', kv);
+    const stats = JSON.parse(kv._store.get('stats:U1'));
+    expect(stats.claimed).toBe(3);
+  });
+
+  it('increments fields independently', async () => {
+    const kv = makeKV();
+    await incrementStat('U1', 'claimed', kv);
+    await incrementStat('U1', 'closed', kv);
+    await incrementStat('U1', 'abandoned', kv);
+    const stats = JSON.parse(kv._store.get('stats:U1'));
+    expect(stats.claimed).toBe(1);
+    expect(stats.closed).toBe(1);
+    expect(stats.abandoned).toBe(1);
+  });
+
+  it('tracks separate users independently', async () => {
+    const kv = makeKV();
+    await incrementStat('U1', 'claimed', kv);
+    await incrementStat('U1', 'claimed', kv);
+    await incrementStat('U2', 'claimed', kv);
+    const u1 = JSON.parse(kv._store.get('stats:U1'));
+    const u2 = JSON.parse(kv._store.get('stats:U2'));
+    expect(u1.claimed).toBe(2);
+    expect(u2.claimed).toBe(1);
   });
 });

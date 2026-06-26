@@ -1,4 +1,25 @@
 /**
+ * Extracts a Slack user ID from a mention string like "<@U123ABC>" or
+ * "<@U123ABC|name>". Returns null if no mention is found.
+ */
+export function parseSlackMention(text) {
+  if (!text) return null;
+  const match = text.match(/<@([A-Z0-9]+)/);
+  return match ? match[1] : null;
+}
+
+/**
+ * Increments a stat counter (claimed/closed/abandoned) for a user in KV.
+ * Accepts the KV namespace directly so it can be injected in tests.
+ */
+export async function incrementStat(userId, field, kv) {
+  const key = `stats:${userId}`;
+  const stats = (await kv.get(key, 'json')) || { claimed: 0, closed: 0, abandoned: 0 };
+  stats[field] = (stats[field] || 0) + 1;
+  await kv.put(key, JSON.stringify(stats));
+}
+
+/**
  * Parses "closes #42", "fixes #7", "resolves #100" etc. from a PR body.
  * Returns an array of unique issue number strings.
  */

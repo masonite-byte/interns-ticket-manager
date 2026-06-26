@@ -10,3 +10,6 @@ SLACK_CHANNEL_ID = "C0BACATB8BY"
 [[kv_namespaces]]
 binding = "TICKET_STORE"
 id = "f3808d3f2a8146059a9447c9df09ff85"
+
+[triggers]
+crons = ["0 9 * * 1-5"]
