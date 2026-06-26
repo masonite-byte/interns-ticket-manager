@@ -45,6 +45,34 @@ async function verifySlackSignature(request, body, signingSecret) {
   return computed === slackSig;
 }
 
+// ── GitHub helpers ────────────────────────────────────────────────────────────
+
+function ghHeaders(env) {
+  return {
+    'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
+    'Accept': 'application/vnd.github+json',
+    'User-Agent': 'interns-ticket-manager',
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+}
+
+async function fetchUnclaimedIssues(env) {
+  const { keys } = await env.TICKET_STORE.list({ prefix: 'claim:' });
+  const claimedNumbers = new Set(keys.map(k => k.name.replace('claim:', '')));
+
+  const url = `https://api.github.com/repos/${env.GITHUB_REPO}/issues?state=open&assignee=none&per_page=50&sort=created&direction=asc`;
+  const resp = await fetch(url, { headers: ghHeaders(env) });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`GitHub API ${resp.status}: ${text}`);
+  }
+  const issues = await resp.json();
+
+  return issues
+    .filter(i => !i.pull_request && !claimedNumbers.has(String(i.number)))
+    .slice(0, 10);
+}
+
 // ── Slack API helpers ─────────────────────────────────────────────────────────
 
 async function postMessage(channelId, text, env, extra = {}) {
@@ -68,6 +96,64 @@ async function postEphemeral(channelId, userId, text, env) {
     },
     body: JSON.stringify({ channel: channelId, user: userId, text }),
   });
+}
+
+async function openClaimModal(triggerId, issues, channelId, userId, env) {
+  const storedGhUser = await env.TICKET_STORE.get(`github_user:${userId}`) || '';
+
+  const options = issues.map(issue => ({
+    text: { type: 'plain_text', text: `#${issue.number} ${issue.title}`.slice(0, 75) },
+    value: String(issue.number),
+  }));
+
+  const modal = {
+    type: 'modal',
+    callback_id: 'claim_issue',
+    private_metadata: JSON.stringify({ channel_id: channelId }),
+    title: { type: 'plain_text', text: 'Claim an Issue' },
+    submit: { type: 'plain_text', text: 'Claim' },
+    close: { type: 'plain_text', text: 'Cancel' },
+    blocks: [
+      {
+        type: 'section',
+        text: { type: 'mrkdwn', text: 'Pick an open issue to claim. It will be assigned to you on GitHub.' },
+      },
+      {
+        type: 'input',
+        block_id: 'issue_select',
+        label: { type: 'plain_text', text: 'Issue' },
+        element: {
+          type: 'static_select',
+          action_id: 'value',
+          placeholder: { type: 'plain_text', text: 'Select an issue...' },
+          options,
+        },
+      },
+      {
+        type: 'input',
+        block_id: 'github_username',
+        label: { type: 'plain_text', text: 'Your GitHub Username' },
+        hint: { type: 'plain_text', text: "We'll save this so you only need to enter it once." },
+        element: {
+          type: 'plain_text_input',
+          action_id: 'value',
+          placeholder: { type: 'plain_text', text: 'e.g. masonite-byte' },
+          ...(storedGhUser ? { initial_value: storedGhUser } : {}),
+        },
+      },
+    ],
+  };
+
+  const resp = await fetch('https://slack.com/api/views.open', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${env.SLACK_BOT_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ trigger_id: triggerId, view: modal }),
+  });
+  const data = await resp.json();
+  if (!data.ok) throw new Error(`views.open failed: ${data.error}`);
 }
 
 // ── Response helpers ──────────────────────────────────────────────────────────
@@ -96,6 +182,7 @@ async function handleSlashCommand(request, env) {
   const command = params.get('command') || '';
   const userId = params.get('user_id') || '';
   const channelId = params.get('channel_id') || '';
+  const triggerId = params.get('trigger_id') || '';
 
   switch (command) {
     case '/ping':
@@ -107,8 +194,23 @@ async function handleSlashCommand(request, env) {
     case '/about':
       return ephemeral(ABOUT_TEXT);
 
-    case '/claim':
-      return ephemeral('Coming soon.');
+    case '/claim': {
+      const work = async () => {
+        try {
+          const issues = await fetchUnclaimedIssues(env);
+          if (issues.length === 0) {
+            await postEphemeral(channelId, userId, 'No unclaimed issues found right now. 🎉', env);
+            return;
+          }
+          await openClaimModal(triggerId, issues, channelId, userId, env);
+        } catch (e) {
+          console.error('/claim error:', e);
+          await postEphemeral(channelId, userId, `Failed to load issues: ${e.message}`, env);
+        }
+      };
+      if (typeof env._ctx?.waitUntil === 'function') env._ctx.waitUntil(work());
+      return ok();
+    }
 
     case '/tickets': {
       const { keys } = await env.TICKET_STORE.list({ prefix: 'claim:' });
@@ -148,8 +250,61 @@ async function handleInteraction(request, env) {
 
   if (payload.type === 'view_submission') {
     const callbackId = payload.view?.callback_id;
-    console.log('view_submission:', callbackId);
-    return ok();
+
+    if (callbackId === 'claim_issue') {
+      const userId = payload.user?.id;
+      const issueNumber = payload.view?.state?.values?.issue_select?.value?.selected_option?.value;
+      const githubUsername = payload.view?.state?.values?.github_username?.value?.value?.trim();
+      let meta = {};
+      try { meta = JSON.parse(payload.view?.private_metadata || '{}'); } catch {}
+      const channelId = meta.channel_id || userId;
+
+      const work = async () => {
+        try {
+          if (githubUsername) {
+            await env.TICKET_STORE.put(`github_user:${userId}`, githubUsername);
+          }
+
+          const issueResp = await fetch(
+            `https://api.github.com/repos/${env.GITHUB_REPO}/issues/${issueNumber}`,
+            { headers: ghHeaders(env) },
+          );
+          if (!issueResp.ok) throw new Error(`GitHub API ${issueResp.status}`);
+          const issue = await issueResp.json();
+
+          if (githubUsername) {
+            const assignResp = await fetch(
+              `https://api.github.com/repos/${env.GITHUB_REPO}/issues/${issueNumber}/assignees`,
+              {
+                method: 'POST',
+                headers: { ...ghHeaders(env), 'Content-Type': 'application/json' },
+                body: JSON.stringify({ assignees: [githubUsername] }),
+              },
+            );
+            if (!assignResp.ok) {
+              const text = await assignResp.text();
+              console.error(`Failed to assign issue: ${assignResp.status}: ${text}`);
+            }
+          }
+
+          await env.TICKET_STORE.put(`claim:${issueNumber}`, JSON.stringify({
+            userId,
+            githubUsername: githubUsername || null,
+            issueNumber: parseInt(issueNumber, 10),
+            issueTitle: issue.title,
+            issueUrl: issue.html_url,
+            claimedAt: new Date().toISOString(),
+          }));
+
+          await postMessage(userId, `✅ You claimed *#${issueNumber}: ${issue.title}*\n${issue.html_url}`, env);
+        } catch (e) {
+          console.error('claim_issue submission error:', e);
+          await postMessage(userId, `❌ Failed to claim issue: ${e.message}`, env);
+        }
+      };
+      if (typeof env._ctx?.waitUntil === 'function') env._ctx.waitUntil(work());
+      return ok();
+    }
   }
 
   return ok();
