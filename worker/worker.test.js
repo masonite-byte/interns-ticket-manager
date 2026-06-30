@@ -620,3 +620,299 @@ describe('GitHub issues closed webhook', () => {
     expect(env.TICKET_STORE._store.has('claim:42')).toBe(true);
   });
 });
+
+// ── /til ──────────────────────────────────────────────────────────────────────
+
+describe('/til', () => {
+  it('returns a usage hint when no text is provided', async () => {
+    const env = makeEnv();
+    const body = 'command=%2Ftil&user_id=U1&channel_id=C1&trigger_id=T1&text=';
+    const req = await signedSlackRequest('/slack/commands', body, env.SLACK_SIGNING_SECRET);
+    const res = await worker.fetch(req, env, ctx);
+    const json = await res.json();
+    expect(json.text).toContain('Usage');
+  });
+
+  it('stores the entry (with permalink) and posts it to the team channel', async () => {
+    const env = makeEnv();
+    const mockFetch = vi.fn().mockImplementation(async (url) => {
+      if (url === 'https://slack.com/api/chat.postMessage') {
+        return { json: async () => ({ ok: true, channel: 'C123', ts: '111.222' }) };
+      }
+      if (url.startsWith('https://slack.com/api/chat.getPermalink')) {
+        return { json: async () => ({ ok: true, permalink: 'https://slack.com/archives/C123/p111222' }) };
+      }
+      return { json: async () => ({ ok: true }) };
+    });
+    vi.stubGlobal('fetch', mockFetch);
+
+    const waitUntilPromises = [];
+    const ctx = { waitUntil: (p) => waitUntilPromises.push(p) };
+    const body = 'command=%2Ftil&user_id=U1&channel_id=C1&trigger_id=T1&text=Learned%20how%20KV%20works';
+    const req = await signedSlackRequest('/slack/commands', body, env.SLACK_SIGNING_SECRET);
+    await worker.fetch(req, env, ctx);
+    await Promise.all(waitUntilPromises);
+
+    const postCall = mockFetch.mock.calls.find(([url]) => url === 'https://slack.com/api/chat.postMessage');
+    expect(postCall).toBeDefined();
+    const postBody = JSON.parse(postCall[1].body);
+    expect(postBody.channel).toBe('C123');
+    expect(postBody.text).toContain('Learned how KV works');
+    expect(postBody.text).toContain('U1');
+
+    const tilKeys = [...env.TICKET_STORE._store.keys()].filter(k => k.startsWith('til:'));
+    expect(tilKeys.length).toBe(1);
+    const stored = JSON.parse(env.TICKET_STORE._store.get(tilKeys[0]));
+    expect(stored.permalink).toBe('https://slack.com/archives/C123/p111222');
+  });
+});
+
+// ── /til-search ────────────────────────────────────────────────────────────────
+
+describe('/til-search', () => {
+  it('returns a usage hint when no keyword is provided', async () => {
+    const env = makeEnv();
+    const body = 'command=%2Ftil-search&user_id=U1&channel_id=C1&trigger_id=T1&text=';
+    const req = await signedSlackRequest('/slack/commands', body, env.SLACK_SIGNING_SECRET);
+    const res = await worker.fetch(req, env, ctx);
+    const json = await res.json();
+    expect(json.text).toContain('Usage');
+  });
+
+  it('returns "no TILs found" when nothing matches', async () => {
+    const env = makeEnv();
+    await env.TICKET_STORE.put('til:2026-06-01T00:00:00.000Z:U1', JSON.stringify({
+      userId: 'U1', text: 'Learned about KV', postedAt: '2026-06-01T00:00:00.000Z',
+    }));
+    const body = 'command=%2Ftil-search&user_id=U1&channel_id=C1&trigger_id=T1&text=kubernetes';
+    const req = await signedSlackRequest('/slack/commands', body, env.SLACK_SIGNING_SECRET);
+    const res = await worker.fetch(req, env, ctx);
+    const json = await res.json();
+    expect(json.text).toContain('No TILs found');
+  });
+
+  it('returns matching entries with a permalink, most recent first', async () => {
+    const env = makeEnv();
+    await env.TICKET_STORE.put('til:2026-06-01T00:00:00.000Z:U1', JSON.stringify({
+      userId: 'U1', text: 'Learned about Slack rate limits', postedAt: '2026-06-01T00:00:00.000Z',
+      permalink: 'https://slack.com/archives/C/p1',
+    }));
+    await env.TICKET_STORE.put('til:2026-06-03T00:00:00.000Z:U2', JSON.stringify({
+      userId: 'U2', text: 'Slack block actions cap at 5 buttons', postedAt: '2026-06-03T00:00:00.000Z',
+      permalink: 'https://slack.com/archives/C/p2',
+    }));
+    const body = 'command=%2Ftil-search&user_id=U1&channel_id=C1&trigger_id=T1&text=slack';
+    const req = await signedSlackRequest('/slack/commands', body, env.SLACK_SIGNING_SECRET);
+    const res = await worker.fetch(req, env, ctx);
+    const json = await res.json();
+    expect(json.text).toContain('U2');
+    expect(json.text).toContain('U1');
+    expect(json.text.indexOf('U2')).toBeLessThan(json.text.indexOf('U1'));
+    expect(json.text).toContain('https://slack.com/archives/C/p2');
+  });
+});
+
+// ── block_actions: blocker_reason ──────────────────────────────────────────────
+
+describe('block_actions: blocker_reason', () => {
+  it('records the response and acks via response_url', async () => {
+    const env = makeEnv();
+    await env.TICKET_STORE.put('claim:5', JSON.stringify({
+      userId: 'U1', issueNumber: 5, issueTitle: 'Fix thing', issueUrl: 'https://github.com/o/r/issues/5',
+    }));
+
+    const mockFetch = vi.fn().mockResolvedValue({ json: async () => ({ ok: true }) });
+    vi.stubGlobal('fetch', mockFetch);
+
+    const payload = {
+      type: 'block_actions',
+      user: { id: 'U1' },
+      response_url: 'https://hooks.slack.com/actions/AAA',
+      actions: [{ action_id: 'blocker_reason', value: '5|waiting_review' }],
+    };
+    const body = 'payload=' + encodeURIComponent(JSON.stringify(payload));
+    const waitUntilPromises = [];
+    const ctx = { waitUntil: (p) => waitUntilPromises.push(p) };
+    const req = await signedSlackRequest('/slack/interactions', body, env.SLACK_SIGNING_SECRET);
+    const res = await worker.fetch(req, env, ctx);
+    expect(res.status).toBe(200);
+    await Promise.all(waitUntilPromises);
+
+    const claim = JSON.parse(env.TICKET_STORE._store.get('claim:5'));
+    expect(claim.blockerReason).toBe('waiting_review');
+    expect(claim.blockerRespondedAt).toBeDefined();
+
+    const ackCall = mockFetch.mock.calls.find(([url]) => url === 'https://hooks.slack.com/actions/AAA');
+    expect(ackCall).toBeDefined();
+    const ackBody = JSON.parse(ackCall[1].body);
+    expect(ackBody.text).toContain('Waiting on review');
+  });
+
+  it('posts to the channel when the reason is confused', async () => {
+    const env = makeEnv();
+    await env.TICKET_STORE.put('claim:5', JSON.stringify({
+      userId: 'U1', issueNumber: 5, issueTitle: 'Fix thing', issueUrl: 'https://github.com/o/r/issues/5',
+    }));
+
+    const mockFetch = vi.fn().mockResolvedValue({ json: async () => ({ ok: true }) });
+    vi.stubGlobal('fetch', mockFetch);
+
+    const payload = {
+      type: 'block_actions',
+      user: { id: 'U1' },
+      actions: [{ action_id: 'blocker_reason', value: '5|confused' }],
+    };
+    const body = 'payload=' + encodeURIComponent(JSON.stringify(payload));
+    const waitUntilPromises = [];
+    const ctx = { waitUntil: (p) => waitUntilPromises.push(p) };
+    const req = await signedSlackRequest('/slack/interactions', body, env.SLACK_SIGNING_SECRET);
+    await worker.fetch(req, env, ctx);
+    await Promise.all(waitUntilPromises);
+
+    const channelCall = mockFetch.mock.calls.find(([url, opts]) => {
+      if (url !== 'https://slack.com/api/chat.postMessage') return false;
+      return JSON.parse(opts.body).channel === 'C123';
+    });
+    expect(channelCall).toBeDefined();
+    const channelBody = JSON.parse(channelCall[1].body);
+    expect(channelBody.text).toContain('could use a hand');
+  });
+
+  it('ignores the click if the clicking user does not own the claim', async () => {
+    const env = makeEnv();
+    await env.TICKET_STORE.put('claim:5', JSON.stringify({
+      userId: 'U1', issueNumber: 5, issueTitle: 'Fix thing', issueUrl: 'https://github.com/o/r/issues/5',
+    }));
+
+    const mockFetch = vi.fn().mockResolvedValue({ json: async () => ({ ok: true }) });
+    vi.stubGlobal('fetch', mockFetch);
+
+    const payload = {
+      type: 'block_actions',
+      user: { id: 'U2' },
+      response_url: 'https://hooks.slack.com/actions/BBB',
+      actions: [{ action_id: 'blocker_reason', value: '5|busy' }],
+    };
+    const body = 'payload=' + encodeURIComponent(JSON.stringify(payload));
+    const waitUntilPromises = [];
+    const ctx = { waitUntil: (p) => waitUntilPromises.push(p) };
+    const req = await signedSlackRequest('/slack/interactions', body, env.SLACK_SIGNING_SECRET);
+    await worker.fetch(req, env, ctx);
+    await Promise.all(waitUntilPromises);
+
+    const claim = JSON.parse(env.TICKET_STORE._store.get('claim:5'));
+    expect(claim.blockerReason).toBeUndefined();
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+});
+
+// ── scheduled: blocker check-in ────────────────────────────────────────────────
+
+describe('scheduled: blocker check-in', () => {
+  it('sends an interactive blocker-check DM for a newly stale claim', async () => {
+    const env = makeEnv();
+    const oldDate = new Date(Date.now() - 4 * 24 * 60 * 60 * 1000).toISOString();
+    await env.TICKET_STORE.put('claim:1', JSON.stringify({
+      userId: 'U1', issueNumber: 1, issueTitle: 'Old issue',
+      issueUrl: 'https://github.com/o/r/issues/1', claimedAt: oldDate,
+    }));
+
+    const mockFetch = vi.fn().mockResolvedValue({ json: async () => ({ ok: true }) });
+    vi.stubGlobal('fetch', mockFetch);
+
+    await worker.scheduled({}, env, {});
+
+    const dmCalls = mockFetch.mock.calls.filter(([url]) => url === 'https://slack.com/api/chat.postMessage');
+    const blockerCall = dmCalls.find(([, opts]) => JSON.parse(opts.body).blocks);
+    expect(blockerCall).toBeDefined();
+    const blockerBody = JSON.parse(blockerCall[1].body);
+    expect(blockerBody.channel).toBe('U1');
+    expect(blockerBody.blocks[1].elements.length).toBe(5);
+
+    const claim = JSON.parse(env.TICKET_STORE._store.get('claim:1'));
+    expect(claim.blockerPromptedAt).toBeDefined();
+  });
+
+  it('does not re-send the blocker check if already prompted', async () => {
+    const env = makeEnv();
+    const oldDate = new Date(Date.now() - 4 * 24 * 60 * 60 * 1000).toISOString();
+    await env.TICKET_STORE.put('claim:1', JSON.stringify({
+      userId: 'U1', issueNumber: 1, issueTitle: 'Old issue',
+      issueUrl: 'https://github.com/o/r/issues/1', claimedAt: oldDate,
+      blockerPromptedAt: new Date().toISOString(),
+    }));
+
+    const mockFetch = vi.fn().mockResolvedValue({ json: async () => ({ ok: true }) });
+    vi.stubGlobal('fetch', mockFetch);
+
+    await worker.scheduled({}, env, {});
+
+    const dmCalls = mockFetch.mock.calls.filter(([url]) => url === 'https://slack.com/api/chat.postMessage');
+    const blockerCall = dmCalls.find(([, opts]) => JSON.parse(opts.body).blocks);
+    expect(blockerCall).toBeUndefined();
+  });
+
+  it('sends a compiled blocker report to the admin', async () => {
+    const env = makeEnv({ ADMIN_USER_ID: 'UADMIN' });
+    const oldDate = new Date(Date.now() - 4 * 24 * 60 * 60 * 1000).toISOString();
+    await env.TICKET_STORE.put('claim:1', JSON.stringify({
+      userId: 'U1', issueNumber: 1, issueTitle: 'Stuck issue',
+      issueUrl: 'https://github.com/o/r/issues/1', claimedAt: oldDate, blockerReason: 'confused',
+    }));
+
+    const mockFetch = vi.fn().mockResolvedValue({ json: async () => ({ ok: true }) });
+    vi.stubGlobal('fetch', mockFetch);
+
+    await worker.scheduled({}, env, {});
+
+    const adminCall = mockFetch.mock.calls.find(([url, opts]) => {
+      if (url !== 'https://slack.com/api/chat.postMessage') return false;
+      return JSON.parse(opts.body).channel === 'UADMIN';
+    });
+    expect(adminCall).toBeDefined();
+    const adminBody = JSON.parse(adminCall[1].body);
+    expect(adminBody.text).toContain('Blocker Report');
+    expect(adminBody.text).toContain('Confused');
+  });
+
+  it('skips the admin report when there are no stale claims', async () => {
+    const env = makeEnv({ ADMIN_USER_ID: 'UADMIN' });
+    await env.TICKET_STORE.put('claim:1', JSON.stringify({
+      userId: 'U1', issueNumber: 1, issueTitle: 'Fresh issue',
+      issueUrl: 'https://github.com/o/r/issues/1', claimedAt: new Date().toISOString(),
+    }));
+
+    const mockFetch = vi.fn().mockResolvedValue({ json: async () => ({ ok: true }) });
+    vi.stubGlobal('fetch', mockFetch);
+
+    await worker.scheduled({}, env, {});
+
+    const adminCall = mockFetch.mock.calls.find(([url, opts]) => {
+      if (url !== 'https://slack.com/api/chat.postMessage') return false;
+      return JSON.parse(opts.body).channel === 'UADMIN';
+    });
+    expect(adminCall).toBeUndefined();
+  });
+});
+
+// ── scheduled: TIL nudge ───────────────────────────────────────────────────────
+
+describe('scheduled: TIL nudge', () => {
+  it('posts a nudge to the team channel and skips the digest logic', async () => {
+    const env = makeEnv();
+    await env.TICKET_STORE.put('claim:1', JSON.stringify({
+      userId: 'U1', issueNumber: 1, issueTitle: 'Some issue',
+      issueUrl: 'https://github.com/o/r/issues/1', claimedAt: new Date().toISOString(),
+    }));
+
+    const mockFetch = vi.fn().mockResolvedValue({ json: async () => ({ ok: true }) });
+    vi.stubGlobal('fetch', mockFetch);
+
+    await worker.scheduled({ cron: '0 21 * * 1-5' }, env, {});
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const callBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(callBody.channel).toBe('C123');
+    expect(callBody.text).toContain('/til');
+  });
+});

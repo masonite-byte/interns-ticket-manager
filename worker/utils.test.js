@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { extractClosedIssues, verifySlackSignature, verifyGitHubSignature, parseSlackMention, incrementStat } from './utils.js';
+import {
+  extractClosedIssues, verifySlackSignature, verifyGitHubSignature, parseSlackMention,
+  incrementStat, blockerLabel, formatBlockerReport, searchTilEntries,
+} from './utils.js';
 
 // ── extractClosedIssues ───────────────────────────────────────────────────────
 
@@ -230,5 +233,72 @@ describe('incrementStat', () => {
     const u2 = JSON.parse(kv._store.get('stats:U2'));
     expect(u1.claimed).toBe(2);
     expect(u2.claimed).toBe(1);
+  });
+});
+
+// ── blockerLabel ──────────────────────────────────────────────────────────────
+
+describe('blockerLabel', () => {
+  it('maps a known value to its human label', () => {
+    expect(blockerLabel('waiting_review')).toBe('Waiting on review');
+    expect(blockerLabel('confused')).toBe('Confused');
+  });
+
+  it('falls back to the raw value when unknown', () => {
+    expect(blockerLabel('something_else')).toBe('something_else');
+  });
+});
+
+// ── formatBlockerReport ────────────────────────────────────────────────────────
+
+describe('formatBlockerReport', () => {
+  it('returns null when there are no stale claims', () => {
+    expect(formatBlockerReport([])).toBeNull();
+    expect(formatBlockerReport(null)).toBeNull();
+  });
+
+  it('buckets claims with no response yet separately from answered ones', () => {
+    const claims = [
+      { userId: 'U1', issueNumber: 1, issueTitle: 'No answer', issueUrl: 'https://x/1' },
+      { userId: 'U2', issueNumber: 2, issueTitle: 'Stuck', issueUrl: 'https://x/2', blockerReason: 'confused' },
+    ];
+    const report = formatBlockerReport(claims);
+    expect(report).toContain('No response yet');
+    expect(report).toContain('Confused');
+    expect(report).toContain('No answer');
+    expect(report).toContain('Stuck');
+  });
+
+  it('groups multiple claims with the same reason under one bucket', () => {
+    const claims = [
+      { userId: 'U1', issueNumber: 1, issueTitle: 'A', issueUrl: 'https://x/1', blockerReason: 'busy' },
+      { userId: 'U2', issueNumber: 2, issueTitle: 'B', issueUrl: 'https://x/2', blockerReason: 'busy' },
+    ];
+    const report = formatBlockerReport(claims);
+    expect(report).toContain('*Busy with other work* (2)');
+  });
+});
+
+// ── searchTilEntries ──────────────────────────────────────────────────────────
+
+describe('searchTilEntries', () => {
+  const entries = [
+    { userId: 'U1', text: 'Learned how KV eventual consistency works', postedAt: '2026-06-01T00:00:00.000Z' },
+    { userId: 'U2', text: 'TIL Slack block actions cap out at 5 buttons', postedAt: '2026-06-03T00:00:00.000Z' },
+    { userId: 'U3', text: 'Found a neat git rebase trick', postedAt: '2026-06-02T00:00:00.000Z' },
+  ];
+
+  it('matches case-insensitively on substring', () => {
+    const matches = searchTilEntries(entries, 'slack');
+    expect(matches.map(m => m.userId)).toEqual(['U2']);
+  });
+
+  it('returns an empty array when nothing matches', () => {
+    expect(searchTilEntries(entries, 'kubernetes')).toEqual([]);
+  });
+
+  it('sorts results most-recent first', () => {
+    const matches = searchTilEntries(entries, '');
+    expect(matches.map(m => m.userId)).toEqual(['U2', 'U3', 'U1']);
   });
 });

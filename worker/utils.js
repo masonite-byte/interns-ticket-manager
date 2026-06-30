@@ -86,3 +86,60 @@ export async function verifyGitHubSignature(request, body, secret) {
 
   return computed === sig;
 }
+
+/**
+ * Reasons an intern can give when nudged about a stale ticket.
+ * `value` is the Slack button payload; `label` is what humans see.
+ */
+export const BLOCKER_OPTIONS = [
+  { value: 'waiting_review', label: 'Waiting on review' },
+  { value: 'waiting_pr', label: 'Waiting on another PR' },
+  { value: 'confused', label: 'Confused' },
+  { value: 'busy', label: 'Busy with other work' },
+  { value: 'forgot_to_close', label: 'Finished but forgot to close' },
+];
+
+export function blockerLabel(value) {
+  const opt = BLOCKER_OPTIONS.find(o => o.value === value);
+  return opt ? opt.label : value;
+}
+
+/**
+ * Builds the manager-facing blocker report from a list of stale claims,
+ * bucketed by blockerReason. Claims with no response yet get their own
+ * bucket. Returns null when there's nothing stale to report.
+ */
+export function formatBlockerReport(staleClaims) {
+  if (!staleClaims || staleClaims.length === 0) return null;
+
+  const buckets = {};
+  for (const claim of staleClaims) {
+    const key = claim.blockerReason || 'no_response';
+    if (!buckets[key]) buckets[key] = [];
+    buckets[key].push(claim);
+  }
+
+  const order = [...BLOCKER_OPTIONS, { value: 'no_response', label: 'No response yet' }];
+  const lines = ['📊 *Blocker Report* — stale tickets and why', ''];
+  for (const { value, label } of order) {
+    const claims = buckets[value];
+    if (!claims || claims.length === 0) continue;
+    lines.push(`*${label}* (${claims.length})`);
+    for (const claim of claims) {
+      lines.push(`• <@${claim.userId}> — <${claim.issueUrl}|#${claim.issueNumber}: ${claim.issueTitle}>`);
+    }
+    lines.push('');
+  }
+  return lines.join('\n').trimEnd();
+}
+
+/**
+ * Filters TIL entries by a case-insensitive substring match against `text`,
+ * sorted most recent first.
+ */
+export function searchTilEntries(entries, keyword) {
+  const needle = keyword.toLowerCase();
+  return entries
+    .filter(t => t.text.toLowerCase().includes(needle))
+    .sort((a, b) => new Date(b.postedAt) - new Date(a.postedAt));
+}
