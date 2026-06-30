@@ -285,14 +285,38 @@ describe('/standup', () => {
   });
 });
 
-// ── scheduled (staleness alerts) ─────────────────────────────────────────────
+// ── scheduled (morning digest) ───────────────────────────────────────────────
 
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
 describe('scheduled', () => {
-  it('DMs users whose claims are older than 3 days', async () => {
+  it('sends a digest DM to users with claimed issues', async () => {
+    const env = makeEnv();
+    await env.TICKET_STORE.put('claim:1', JSON.stringify({
+      userId: 'U1',
+      issueNumber: 1,
+      issueTitle: 'Fix the thing',
+      issueUrl: 'https://github.com/o/r/issues/1',
+      claimedAt: new Date().toISOString(),
+    }));
+
+    const mockFetch = vi.fn().mockResolvedValue({ json: async () => ({ ok: true }) });
+    vi.stubGlobal('fetch', mockFetch);
+
+    await worker.scheduled({}, env, {});
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      'https://slack.com/api/chat.postMessage',
+      expect.objectContaining({ method: 'POST' }),
+    );
+    const callBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(callBody.channel).toBe('U1');
+    expect(callBody.text).toContain('Fix the thing');
+  });
+
+  it('flags stale issues with a warning badge', async () => {
     const env = makeEnv();
     const oldDate = new Date(Date.now() - 4 * 24 * 60 * 60 * 1000).toISOString();
     await env.TICKET_STORE.put('claim:1', JSON.stringify({
@@ -308,34 +332,30 @@ describe('scheduled', () => {
 
     await worker.scheduled({}, env, {});
 
-    expect(mockFetch).toHaveBeenCalledWith(
-      'https://slack.com/api/chat.postMessage',
-      expect.objectContaining({ method: 'POST' }),
-    );
     const callBody = JSON.parse(mockFetch.mock.calls[0][1].body);
-    expect(callBody.channel).toBe('U1');
-    expect(callBody.text).toContain('Old issue');
+    expect(callBody.text).toContain('⚠️');
   });
 
-  it('does not DM users with fresh claims', async () => {
+  it('does not flag fresh claims with a warning badge', async () => {
     const env = makeEnv();
-    const recentDate = new Date(Date.now() - 1 * 24 * 60 * 60 * 1000).toISOString();
     await env.TICKET_STORE.put('claim:1', JSON.stringify({
       userId: 'U1',
       issueNumber: 1,
       issueTitle: 'Recent issue',
-      claimedAt: recentDate,
+      issueUrl: 'https://github.com/o/r/issues/1',
+      claimedAt: new Date().toISOString(),
     }));
 
-    const mockFetch = vi.fn();
+    const mockFetch = vi.fn().mockResolvedValue({ json: async () => ({ ok: true }) });
     vi.stubGlobal('fetch', mockFetch);
 
     await worker.scheduled({}, env, {});
 
-    expect(mockFetch).not.toHaveBeenCalled();
+    const callBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(callBody.text).not.toContain('⚠️');
   });
 
-  it('uses lastProgressAt over claimedAt when present', async () => {
+  it('uses lastProgressAt over claimedAt when checking staleness', async () => {
     const env = makeEnv();
     const oldClaim = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
     const recentProgress = new Date(Date.now() - 1 * 24 * 60 * 60 * 1000).toISOString();
@@ -343,14 +363,206 @@ describe('scheduled', () => {
       userId: 'U1',
       issueNumber: 1,
       issueTitle: 'Active issue',
+      issueUrl: 'https://github.com/o/r/issues/1',
       claimedAt: oldClaim,
       lastProgressAt: recentProgress,
     }));
 
-    const mockFetch = vi.fn();
+    const mockFetch = vi.fn().mockResolvedValue({ json: async () => ({ ok: true }) });
     vi.stubGlobal('fetch', mockFetch);
 
     await worker.scheduled({}, env, {});
+
+    const callBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(callBody.text).not.toContain('⚠️');
+  });
+
+  it('does not send a digest when there are no claims', async () => {
+    const env = makeEnv();
+    const mockFetch = vi.fn();
+    vi.stubGlobal('fetch', mockFetch);
+    await worker.scheduled({}, env, {});
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+});
+
+// ── /prs ─────────────────────────────────────────────────────────────────────
+
+describe('/prs', () => {
+  it('returns "no GitHub username" message when none is stored', async () => {
+    const env = makeEnv();
+    let ephemeralText = null;
+    const mockFetch = vi.fn().mockImplementation(async (url) => {
+      if (url === 'https://slack.com/api/chat.postEphemeral') {
+        return { json: async () => ({ ok: true }) };
+      }
+      return { ok: true, json: async () => ({}) };
+    });
+    vi.stubGlobal('fetch', mockFetch);
+
+    const waitUntilPromises = [];
+    const ctx = { waitUntil: (p) => waitUntilPromises.push(p) };
+    const body = 'command=%2Fprs&user_id=U1&channel_id=C1&trigger_id=T1&text=';
+    const req = await signedSlackRequest('/slack/commands', body, env.SLACK_SIGNING_SECRET);
+    const res = await worker.fetch(req, env, ctx);
+    expect(res.status).toBe(200);
+
+    await Promise.all(waitUntilPromises);
+    const ephemeralCall = mockFetch.mock.calls.find(([url]) => url === 'https://slack.com/api/chat.postEphemeral');
+    expect(ephemeralCall).toBeDefined();
+    const ephBody = JSON.parse(ephemeralCall[1].body);
+    expect(ephBody.text).toContain('/claim');
+  });
+
+  it('posts an ephemeral list of open PRs with review state badges', async () => {
+    const env = makeEnv();
+    await env.TICKET_STORE.put('github_user:U1', 'masonite-byte');
+
+    const mockFetch = vi.fn().mockImplementation(async (url) => {
+      if (url.includes('/search/issues')) {
+        return { ok: true, json: async () => ({ items: [{ number: 99, title: 'My PR', html_url: 'https://github.com/o/r/pull/99' }] }) };
+      }
+      if (url.includes('/pulls/99/reviews')) {
+        return { ok: true, json: async () => [] };
+      }
+      return { ok: true, json: async () => ({ ok: true }) };
+    });
+    vi.stubGlobal('fetch', mockFetch);
+
+    const waitUntilPromises = [];
+    const ctx = { waitUntil: (p) => waitUntilPromises.push(p) };
+    const body = 'command=%2Fprs&user_id=U1&channel_id=C1&trigger_id=T1&text=';
+    const req = await signedSlackRequest('/slack/commands', body, env.SLACK_SIGNING_SECRET);
+    await worker.fetch(req, env, ctx);
+    await Promise.all(waitUntilPromises);
+
+    const ephemeralCall = mockFetch.mock.calls.find(([url]) => url === 'https://slack.com/api/chat.postEphemeral');
+    expect(ephemeralCall).toBeDefined();
+    const ephBody = JSON.parse(ephemeralCall[1].body);
+    expect(ephBody.text).toContain('My PR');
+    expect(ephBody.text).toContain('⏳');
+  });
+});
+
+// ── PR link check ─────────────────────────────────────────────────────────────
+
+describe('PR link check', () => {
+  it('DMs intern when they open a PR with no linked issue but have a claim', async () => {
+    const env = makeEnv();
+    await env.TICKET_STORE.put('claim:5', JSON.stringify({
+      userId: 'U1', issueNumber: 5, issueTitle: 'Some issue', githubUsername: 'masonite-byte',
+    }));
+    await env.TICKET_STORE.put('github_user:U1', 'masonite-byte');
+
+    const mockFetch = vi.fn().mockResolvedValue({ json: async () => ({ ok: true }) });
+    vi.stubGlobal('fetch', mockFetch);
+
+    const prPayload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        html_url: 'https://github.com/o/r/pull/10',
+        title: 'Add feature',
+        body: 'No closes keyword here.',
+        user: { login: 'masonite-byte' },
+      },
+    });
+    const waitUntilPromises = [];
+    const ctx = { waitUntil: (p) => waitUntilPromises.push(p) };
+    const req = await signedGitHubRequest('/github/webhook', prPayload, env.GITHUB_WEBHOOK_SECRET, 'pull_request');
+    await worker.fetch(req, env, ctx);
+    await Promise.all(waitUntilPromises);
+
+    const dmCall = mockFetch.mock.calls.find(([url]) => url === 'https://slack.com/api/chat.postMessage');
+    expect(dmCall).toBeDefined();
+    const dmBody = JSON.parse(dmCall[1].body);
+    expect(dmBody.channel).toBe('U1');
+    expect(dmBody.text).toContain('Closes #N');
+  });
+
+  it('does not DM when the PR author has no claimed issues', async () => {
+    const env = makeEnv();
+
+    const mockFetch = vi.fn().mockResolvedValue({ json: async () => ({ ok: true }) });
+    vi.stubGlobal('fetch', mockFetch);
+
+    const prPayload = JSON.stringify({
+      action: 'opened',
+      pull_request: {
+        html_url: 'https://github.com/o/r/pull/10',
+        title: 'Unrelated PR',
+        body: 'Just a chore.',
+        user: { login: 'masonite-byte' },
+      },
+    });
+    const waitUntilPromises = [];
+    const ctx = { waitUntil: (p) => waitUntilPromises.push(p) };
+    const req = await signedGitHubRequest('/github/webhook', prPayload, env.GITHUB_WEBHOOK_SECRET, 'pull_request');
+    await worker.fetch(req, env, ctx);
+    await Promise.all(waitUntilPromises);
+
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+});
+
+// ── changes-requested DM ──────────────────────────────────────────────────────
+
+describe('changes-requested DM', () => {
+  it('DMs the PR author when changes are requested', async () => {
+    const env = makeEnv();
+    await env.TICKET_STORE.put('github_user:U1', 'masonite-byte');
+
+    const mockFetch = vi.fn().mockResolvedValue({ json: async () => ({ ok: true }) });
+    vi.stubGlobal('fetch', mockFetch);
+
+    const reviewPayload = JSON.stringify({
+      action: 'submitted',
+      review: { state: 'changes_requested', user: { login: 'reviewer-jane' } },
+      pull_request: {
+        number: 7,
+        html_url: 'https://github.com/o/r/pull/7',
+        title: 'My feature',
+        user: { login: 'masonite-byte' },
+      },
+    });
+    const waitUntilPromises = [];
+    const ctx = { waitUntil: (p) => waitUntilPromises.push(p) };
+    const req = await signedGitHubRequest('/github/webhook', reviewPayload, env.GITHUB_WEBHOOK_SECRET, 'pull_request_review');
+    const res = await worker.fetch(req, env, ctx);
+    expect(res.status).toBe(200);
+    await Promise.all(waitUntilPromises);
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      'https://slack.com/api/chat.postMessage',
+      expect.objectContaining({ method: 'POST' }),
+    );
+    const dmBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(dmBody.channel).toBe('U1');
+    expect(dmBody.text).toContain('🔴');
+    expect(dmBody.text).toContain('reviewer-jane');
+  });
+
+  it('does not DM for approved reviews', async () => {
+    const env = makeEnv();
+    await env.TICKET_STORE.put('github_user:U1', 'masonite-byte');
+
+    const mockFetch = vi.fn().mockResolvedValue({ json: async () => ({ ok: true }) });
+    vi.stubGlobal('fetch', mockFetch);
+
+    const reviewPayload = JSON.stringify({
+      action: 'submitted',
+      review: { state: 'approved', user: { login: 'reviewer-jane' } },
+      pull_request: {
+        number: 7,
+        html_url: 'https://github.com/o/r/pull/7',
+        title: 'My feature',
+        user: { login: 'masonite-byte' },
+      },
+    });
+    const waitUntilPromises = [];
+    const ctx = { waitUntil: (p) => waitUntilPromises.push(p) };
+    const req = await signedGitHubRequest('/github/webhook', reviewPayload, env.GITHUB_WEBHOOK_SECRET, 'pull_request_review');
+    await worker.fetch(req, env, ctx);
+    await Promise.all(waitUntilPromises);
 
     expect(mockFetch).not.toHaveBeenCalled();
   });

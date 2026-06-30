@@ -71,6 +71,40 @@ async function fetchUnclaimedIssues(env) {
     .slice(0, 10);
 }
 
+async function lookupSlackId(githubUsername, env) {
+  const { keys } = await env.TICKET_STORE.list({ prefix: 'github_user:' });
+  for (const { name } of keys) {
+    const stored = await env.TICKET_STORE.get(name);
+    if (stored === githubUsername) return name.replace('github_user:', '');
+  }
+  return null;
+}
+
+async function fetchUserPRs(githubUsername, env) {
+  const q = encodeURIComponent(`type:pr state:open author:${githubUsername} repo:${env.GITHUB_REPO}`);
+  const resp = await fetch(`https://api.github.com/search/issues?q=${q}&per_page=20`, { headers: ghHeaders(env) });
+  if (!resp.ok) return [];
+  const data = await resp.json();
+  return (data.items || []).map(i => ({ number: i.number, title: i.title, url: i.html_url }));
+}
+
+async function fetchPRReviewState(prNumber, env) {
+  const resp = await fetch(
+    `https://api.github.com/repos/${env.GITHUB_REPO}/pulls/${prNumber}/reviews`,
+    { headers: ghHeaders(env) },
+  );
+  if (!resp.ok) return 'pending';
+  const reviews = await resp.json();
+  const byReviewer = {};
+  for (const r of reviews) {
+    if (r.state !== 'COMMENTED') byReviewer[r.user.login] = r.state;
+  }
+  const states = Object.values(byReviewer);
+  if (states.includes('CHANGES_REQUESTED')) return 'changes_requested';
+  if (states.length > 0 && states.every(s => s === 'APPROVED')) return 'approved';
+  return 'pending';
+}
+
 // ── Slack API helpers ─────────────────────────────────────────────────────────
 
 async function postMessage(channelId, text, env, extra = {}) {
@@ -333,6 +367,35 @@ async function handleSlashCommand(request, env, ctx) {
       return ok();
     }
 
+    case '/prs': {
+      const work = async () => {
+        try {
+          const githubUsername = await env.TICKET_STORE.get(`github_user:${userId}`);
+          if (!githubUsername) {
+            await postEphemeral(channelId, userId, 'No GitHub username on file — use `/claim` to register one.', env);
+            return;
+          }
+          const prs = await fetchUserPRs(githubUsername, env);
+          if (prs.length === 0) {
+            await postEphemeral(channelId, userId, 'You have no open PRs.', env);
+            return;
+          }
+          const reviewStates = await Promise.all(prs.map(pr => fetchPRReviewState(pr.number, env)));
+          const badges = { changes_requested: '🔴', approved: '✅', pending: '⏳' };
+          const lines = ['*Your open PRs:*'];
+          prs.forEach((pr, i) => {
+            lines.push(`${badges[reviewStates[i]]} <${pr.url}|#${pr.number}: ${pr.title}>`);
+          });
+          await postEphemeral(channelId, userId, lines.join('\n'), env);
+        } catch (e) {
+          console.error('/prs error:', e);
+          await postEphemeral(channelId, userId, `Failed to load PRs: ${e.message}`, env);
+        }
+      };
+      ctx.waitUntil(work());
+      return ok();
+    }
+
     case '/whois': {
       const targetId = parseSlackMention(text) || userId;
 
@@ -572,10 +635,31 @@ async function handleGitHubWebhook(request, env, ctx) {
   }
 
   const event = request.headers.get('X-GitHub-Event');
-  if (event !== 'pull_request' && event !== 'issues') return ok();
+  if (event !== 'pull_request' && event !== 'issues' && event !== 'pull_request_review') return ok();
 
   const payload = JSON.parse(body);
   const action = payload.action;
+
+  if (event === 'pull_request_review') {
+    if (payload.action === 'submitted' && payload.review?.state === 'changes_requested') {
+      const ghUsername = payload.pull_request?.user?.login;
+      const prUrl = payload.pull_request?.html_url;
+      const prTitle = payload.pull_request?.title;
+      const prNumber = payload.pull_request?.number;
+      const reviewer = payload.review?.user?.login;
+      const work = async () => {
+        const slackId = await lookupSlackId(ghUsername, env);
+        if (slackId) {
+          await postMessage(slackId,
+            `🔴 Changes requested on your PR <${prUrl}|#${prNumber}: ${prTitle}> by @${reviewer}`,
+            env,
+          );
+        }
+      };
+      ctx.waitUntil(work());
+    }
+    return ok();
+  }
 
   if (event === 'issues') {
     if (action === 'closed') {
@@ -594,7 +678,29 @@ async function handleGitHubWebhook(request, env, ctx) {
   const prTitle = pr.title;
   const issueNumbers = extractClosedIssues(pr.body);
 
-  if (issueNumbers.length === 0) return ok();
+  if (issueNumbers.length === 0) {
+    if (action === 'opened') {
+      const ghUsername = pr.user?.login;
+      if (ghUsername) {
+        const work = async () => {
+          const { keys } = await env.TICKET_STORE.list({ prefix: 'claim:' });
+          const claims = (await Promise.all(keys.map(k => env.TICKET_STORE.get(k.name, 'json')))).filter(Boolean);
+          const hasClaim = claims.some(c => c.githubUsername === ghUsername);
+          if (hasClaim) {
+            const slackId = await lookupSlackId(ghUsername, env);
+            if (slackId) {
+              await postMessage(slackId,
+                `👀 Your PR <${prUrl}|${prTitle}> doesn't close any tracked issue — did you mean to add \`Closes #N\`?`,
+                env,
+              );
+            }
+          }
+        };
+        ctx.waitUntil(work());
+      }
+    }
+    return ok();
+  }
 
   const work = async () => {
     for (const num of issueNumbers) {
@@ -660,18 +766,38 @@ export default {
       keys.map(k => env.TICKET_STORE.get(k.name, 'json')),
     )).filter(Boolean);
 
+    const byUser = {};
     for (const claim of claims) {
-      const lastActivity = claim.lastProgressAt || claim.claimedAt;
-      if (!lastActivity) continue;
+      if (!byUser[claim.userId]) byUser[claim.userId] = [];
+      byUser[claim.userId].push(claim);
+    }
 
-      const ageMs = now - new Date(lastActivity).getTime();
-      if (ageMs >= THREE_DAYS_MS) {
-        await postMessage(
-          claim.userId,
-          `👋 Heads up — issue #${claim.issueNumber} *${claim.issueTitle}* hasn't had an update in 3+ days. Post a \`/progress\` update or \`/abandon\` if you're stepping away.`,
-          env,
-        );
+    for (const [userId, userClaims] of Object.entries(byUser)) {
+      const githubUsername = await env.TICKET_STORE.get(`github_user:${userId}`);
+
+      let prs = [];
+      if (githubUsername) {
+        try { prs = await fetchUserPRs(githubUsername, env); } catch {}
       }
+
+      const lines = ['📋 *Your morning update*', '', '*Issues:*'];
+      for (const claim of userClaims) {
+        const lastActivity = claim.lastProgressAt || claim.claimedAt;
+        const stale = lastActivity && (now - new Date(lastActivity).getTime()) >= THREE_DAYS_MS;
+        lines.push(`• <${claim.issueUrl}|#${claim.issueNumber}: ${claim.issueTitle}>${stale ? ' ⚠️' : ''}`);
+      }
+
+      if (prs.length > 0) {
+        lines.push('', '*PRs:*');
+        const badges = { changes_requested: '🔴', approved: '✅', pending: '⏳' };
+        for (const pr of prs) {
+          let state = 'pending';
+          try { state = await fetchPRReviewState(pr.number, env); } catch {}
+          lines.push(`${badges[state]} <${pr.url}|#${pr.number}: ${pr.title}>`);
+        }
+      }
+
+      await postMessage(userId, lines.join('\n'), env);
     }
   },
 };
