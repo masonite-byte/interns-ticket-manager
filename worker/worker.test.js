@@ -728,7 +728,7 @@ describe('block_actions: blocker_reason', () => {
       type: 'block_actions',
       user: { id: 'U1' },
       response_url: 'https://hooks.slack.com/actions/AAA',
-      actions: [{ action_id: 'blocker_reason', value: '5|waiting_review' }],
+      actions: [{ action_id: 'blocker_reason_waiting_review', value: '5|waiting_review' }],
     };
     const body = 'payload=' + encodeURIComponent(JSON.stringify(payload));
     const waitUntilPromises = [];
@@ -760,7 +760,7 @@ describe('block_actions: blocker_reason', () => {
     const payload = {
       type: 'block_actions',
       user: { id: 'U1' },
-      actions: [{ action_id: 'blocker_reason', value: '5|confused' }],
+      actions: [{ action_id: 'blocker_reason_confused', value: '5|confused' }],
     };
     const body = 'payload=' + encodeURIComponent(JSON.stringify(payload));
     const waitUntilPromises = [];
@@ -791,7 +791,7 @@ describe('block_actions: blocker_reason', () => {
       type: 'block_actions',
       user: { id: 'U2' },
       response_url: 'https://hooks.slack.com/actions/BBB',
-      actions: [{ action_id: 'blocker_reason', value: '5|busy' }],
+      actions: [{ action_id: 'blocker_reason_busy', value: '5|busy' }],
     };
     const body = 'payload=' + encodeURIComponent(JSON.stringify(payload));
     const waitUntilPromises = [];
@@ -828,6 +828,7 @@ describe('scheduled: blocker check-in', () => {
     const blockerBody = JSON.parse(blockerCall[1].body);
     expect(blockerBody.channel).toBe('U1');
     expect(blockerBody.blocks[1].elements.length).toBe(5);
+    expect(blockerBody.blocks[1].elements.every(el => el.style === 'primary')).toBe(true);
 
     const claim = JSON.parse(env.TICKET_STORE._store.get('claim:1'));
     expect(claim.blockerPromptedAt).toBeDefined();

@@ -21,6 +21,8 @@
 # Cloudflare / Wrangler
 # =========================
 .wrangler/
+.dev.vars
+.dev.vars.*
 
 # =========================
 # Go binaries

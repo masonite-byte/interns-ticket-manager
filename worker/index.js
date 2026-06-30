@@ -294,9 +294,10 @@ async function sendBlockerCheck(claim, env) {
         block_id: 'blocker_check',
         elements: BLOCKER_OPTIONS.map(opt => ({
           type: 'button',
-          action_id: 'blocker_reason',
+          action_id: `blocker_reason_${opt.value}`,
           text: { type: 'plain_text', text: opt.label },
           value: `${claim.issueNumber}|${opt.value}`,
+          style: 'primary',
         })),
       },
     ],
@@ -576,7 +577,7 @@ async function handleInteraction(request, env, ctx) {
   if (payload.type === 'block_actions') {
     const action = payload.actions?.[0];
 
-    if (action?.action_id === 'blocker_reason') {
+    if (action?.action_id?.startsWith('blocker_reason_')) {
       const [issueNumber, reasonValue] = (action.value || '').split('|');
       const userId = payload.user?.id;
       const responseUrl = payload.response_url;
@@ -598,7 +599,7 @@ async function handleInteraction(request, env, ctx) {
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 replace_original: true,
-                text: `Got it — marked *#${issueNumber}* as "${blockerLabel(reasonValue)}". Thanks!`,
+                text: `✅ Got it — *#${issueNumber}* marked as *"${blockerLabel(reasonValue)}"*. Thanks for the update!`,
               }),
             });
           }
