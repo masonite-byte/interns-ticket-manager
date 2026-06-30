@@ -13,6 +13,8 @@ Built on Cloudflare Workers (JavaScript) with Go binaries for GitHub operations,
 | `/claim` | Pick an unclaimed GitHub issue to work on. Assigns you on GitHub, adds the `in-progress` label, and posts a comment. |
 | `/abandon` | Drop an issue you claimed. Unassigns you on GitHub, removes the label, and cleans up the comment. |
 | `/progress` | Post a status update on one of your claimed issues. Resets the staleness clock. |
+| `/til <text>` | Share something you learned today. Posts to the team channel and logs it. |
+| `/til-search <keyword>` | Search past TILs by keyword, most recent first. |
 | `/whois [@user]` | See what issues someone has claimed. Defaults to yourself if no mention. |
 | `/tickets` | Show all currently claimed tickets across the team. |
 | `/standup` | Show a standup-style summary of everyone's active claims. |
@@ -24,6 +26,9 @@ Built on Cloudflare Workers (JavaScript) with Go binaries for GitHub operations,
 - **PR announcements** — when an intern opens a PR that references a claimed issue (`closes #N`, `fixes #N`, `resolves #N`), the bot posts to the channel. On merge, it marks the issue closed and updates stats.
 - **Issue closed** — if an issue is closed directly on GitHub (without a PR), the claim is cleaned up automatically.
 - **Staleness alerts** — weekdays at 9am UTC, the bot DMs any intern whose claimed issue hasn't had a `/progress` update in 3+ days.
+- **Blocker check-in** — the first time a claimed issue goes stale, the bot DMs the intern an interactive prompt ("Waiting on review", "Confused", etc.) instead of just flagging it. The answer is cleared the next time they post `/progress`, so it re-asks once per staleness episode, not every day. A "Confused" answer also pings the channel right away.
+- **Blocker report** — right after the morning digest, `ADMIN_USER_ID` gets a compiled DM of every stale ticket and why (or "no response yet"), so blockers show up as data instead of a wall of stale tickets.
+- **TIL nudge** — weekdays at 9pm UTC, the bot prompts the channel to share one thing learned that day via `/til`.
 
 ---
 
@@ -61,7 +66,7 @@ Also set these as plain vars in `wrangler.toml` (already present):
 3. Under **Slash Commands**, register each command pointing to:
    `https://<your-worker>.workers.dev/slack/commands`
 
-   Commands: `/claim`, `/abandon`, `/progress`, `/whois`, `/tickets`, `/standup`, `/stats`, `/ping`
+   Commands: `/claim`, `/abandon`, `/progress`, `/til`, `/til-search`, `/whois`, `/tickets`, `/standup`, `/stats`, `/ping`
 
 4. Under **Interactivity & Shortcuts**, set the Request URL to:
    `https://<your-worker>.workers.dev/slack/interactions`
@@ -100,10 +105,14 @@ Worker → GitHub Actions workflow_dispatch → Go binary (cmd/claim or cmd/aban
   → Slack API (DM + channel announcement)
 
 Cloudflare KV (TICKET_STORE):
-  claim:{issueNumber}   → claim record (userId, githubUsername, issueTitle, ...)
-  github_user:{userId}  → cached GitHub username
-  stats:{userId}        → { claimed, closed, abandoned }
+  claim:{issueNumber}        → claim record (userId, githubUsername, issueTitle, ...,
+                                blockerReason, blockerPromptedAt, blockerRespondedAt)
+  github_user:{userId}       → cached GitHub username
+  stats:{userId}             → { claimed, closed, abandoned }
+  til:{timestamp}:{userId}   → { userId, text, postedAt, permalink }
 ```
+
+Two cron triggers drive `scheduled()`: `0 9 * * 1-5` (morning digest + blocker check-in + admin blocker report) and `0 21 * * 1-5` (TIL nudge).
 
 The Worker handles all Slack-facing requests. Go binaries run in GitHub Actions (triggered via `workflow_dispatch`) for GitHub operations that don't need to complete within Slack's 3-second response deadline.
 

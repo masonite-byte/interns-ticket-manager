@@ -1,10 +1,17 @@
-import { extractClosedIssues, verifySlackSignature, verifyGitHubSignature, parseSlackMention, incrementStat } from './utils.js';
+import {
+  extractClosedIssues, verifySlackSignature, verifyGitHubSignature, parseSlackMention,
+  incrementStat, BLOCKER_OPTIONS, blockerLabel, formatBlockerReport, searchTilEntries,
+} from './utils.js';
+
+const TIL_NUDGE_CRON = '0 21 * * 1-5';
 
 const HELP_TEXT = [
   'Supported slash commands:',
   '/claim     - pick an unclaimed issue to work on.',
   '/abandon   - drop an issue you previously claimed.',
   '/progress  - post a status update on one of your claimed issues.',
+  '/til       - share something you learned today.',
+  '/til-search - search past TILs by keyword.',
   '/whois     - see what issues someone has claimed.',
   '/stats     - show the leaderboard.',
   '/tickets   - show all currently claimed tickets.',
@@ -117,6 +124,15 @@ async function postMessage(channelId, text, env, extra = {}) {
     body: JSON.stringify({ channel: channelId, text, ...extra }),
   });
   return resp.json();
+}
+
+async function getPermalink(channelId, messageTs, env) {
+  const url = `https://slack.com/api/chat.getPermalink?channel=${encodeURIComponent(channelId)}&message_ts=${encodeURIComponent(messageTs)}`;
+  const resp = await fetch(url, {
+    headers: { 'Authorization': `Bearer ${env.SLACK_BOT_TOKEN}` },
+  });
+  const data = await resp.json();
+  return data.ok ? data.permalink : null;
 }
 
 async function postEphemeral(channelId, userId, text, env) {
@@ -263,6 +279,30 @@ async function openProgressModal(triggerId, claims, channelId, env) {
   }, env);
 }
 
+async function sendBlockerCheck(claim, env) {
+  await postMessage(claim.userId, `Still working on #${claim.issueNumber}: ${claim.issueTitle}?`, env, {
+    blocks: [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `It's been quiet on <${claim.issueUrl}|#${claim.issueNumber}: ${claim.issueTitle}> for a few days — what's going on?`,
+        },
+      },
+      {
+        type: 'actions',
+        block_id: 'blocker_check',
+        elements: BLOCKER_OPTIONS.map(opt => ({
+          type: 'button',
+          action_id: 'blocker_reason',
+          text: { type: 'plain_text', text: opt.label },
+          value: `${claim.issueNumber}|${opt.value}`,
+        })),
+      },
+    ],
+  });
+}
+
 // ── Response helpers ──────────────────────────────────────────────────────────
 
 function ephemeral(text, status = 200) {
@@ -365,6 +405,45 @@ async function handleSlashCommand(request, env, ctx) {
       };
       ctx.waitUntil(work());
       return ok();
+    }
+
+    case '/til': {
+      if (!text) {
+        return ephemeral('Usage: `/til <something you learned today>`');
+      }
+      const work = async () => {
+        try {
+          const postedAt = new Date().toISOString();
+          const posted = await postMessage(env.SLACK_CHANNEL_ID, `📚 *TIL from <@${userId}>:* ${text}`, env);
+          const permalink = posted.ok ? await getPermalink(posted.channel, posted.ts, env) : null;
+          await env.TICKET_STORE.put(`til:${postedAt}:${userId}`, JSON.stringify({ userId, text, postedAt, permalink }));
+        } catch (e) {
+          console.error('/til error:', e);
+          await postEphemeral(channelId, userId, `Failed to post TIL: ${e.message}`, env);
+        }
+      };
+      ctx.waitUntil(work());
+      return ok();
+    }
+
+    case '/til-search': {
+      if (!text) {
+        return ephemeral('Usage: `/til-search <keyword>`');
+      }
+      const { keys } = await env.TICKET_STORE.list({ prefix: 'til:' });
+      const all = (await Promise.all(keys.map(k => env.TICKET_STORE.get(k.name, 'json')))).filter(Boolean);
+      const matches = searchTilEntries(all, text);
+
+      if (matches.length === 0) {
+        return ephemeral(`No TILs found matching "${text}".`);
+      }
+
+      const lines = [`*TILs matching "${text}":*`];
+      for (const t of matches.slice(0, 10)) {
+        const link = t.permalink ? ` — <${t.permalink}|view>` : '';
+        lines.push(`• <@${t.userId}>: ${t.text}${link}`);
+      }
+      return ephemeral(lines.join('\n'));
     }
 
     case '/prs': {
@@ -496,6 +575,48 @@ async function handleInteraction(request, env, ctx) {
 
   if (payload.type === 'block_actions') {
     const action = payload.actions?.[0];
+
+    if (action?.action_id === 'blocker_reason') {
+      const [issueNumber, reasonValue] = (action.value || '').split('|');
+      const userId = payload.user?.id;
+      const responseUrl = payload.response_url;
+
+      const work = async () => {
+        try {
+          const claim = await env.TICKET_STORE.get(`claim:${issueNumber}`, 'json');
+          if (!claim || claim.userId !== userId) return;
+
+          await env.TICKET_STORE.put(`claim:${issueNumber}`, JSON.stringify({
+            ...claim,
+            blockerReason: reasonValue,
+            blockerRespondedAt: new Date().toISOString(),
+          }));
+
+          if (responseUrl) {
+            await fetch(responseUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                replace_original: true,
+                text: `Got it — marked *#${issueNumber}* as "${blockerLabel(reasonValue)}". Thanks!`,
+              }),
+            });
+          }
+
+          if (reasonValue === 'confused') {
+            await postMessage(claim.channelId || env.SLACK_CHANNEL_ID,
+              `🆘 <@${userId}> could use a hand on <${claim.issueUrl}|#${issueNumber}: ${claim.issueTitle}>`,
+              env,
+            );
+          }
+        } catch (e) {
+          console.error('blocker_reason action error:', e);
+        }
+      };
+      ctx.waitUntil(work());
+      return ok();
+    }
+
     console.log('block_action:', action?.action_id);
     return ok();
   }
@@ -603,6 +724,9 @@ async function handleInteraction(request, env, ctx) {
             await env.TICKET_STORE.put(`claim:${issueNumber}`, JSON.stringify({
               ...claim,
               lastProgressAt: new Date().toISOString(),
+              blockerReason: null,
+              blockerPromptedAt: null,
+              blockerRespondedAt: null,
             }));
           }
 
@@ -758,6 +882,14 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
+    if (event.cron === TIL_NUDGE_CRON) {
+      await postMessage(env.SLACK_CHANNEL_ID,
+        "📚 What's one small thing you learned today? Share it with `/til <your answer>`.",
+        env,
+      );
+      return;
+    }
+
     const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
     const now = Date.now();
 
@@ -772,6 +904,8 @@ export default {
       byUser[claim.userId].push(claim);
     }
 
+    const staleClaims = [];
+
     for (const [userId, userClaims] of Object.entries(byUser)) {
       const githubUsername = await env.TICKET_STORE.get(`github_user:${userId}`);
 
@@ -785,6 +919,7 @@ export default {
         const lastActivity = claim.lastProgressAt || claim.claimedAt;
         const stale = lastActivity && (now - new Date(lastActivity).getTime()) >= THREE_DAYS_MS;
         lines.push(`• <${claim.issueUrl}|#${claim.issueNumber}: ${claim.issueTitle}>${stale ? ' ⚠️' : ''}`);
+        if (stale) staleClaims.push(claim);
       }
 
       if (prs.length > 0) {
@@ -798,6 +933,21 @@ export default {
       }
 
       await postMessage(userId, lines.join('\n'), env);
+    }
+
+    // Ask why, once per staleness episode (cleared again when /progress is posted).
+    for (const claim of staleClaims) {
+      if (claim.blockerPromptedAt) continue;
+      await env.TICKET_STORE.put(`claim:${claim.issueNumber}`, JSON.stringify({
+        ...claim,
+        blockerPromptedAt: new Date().toISOString(),
+      }));
+      await sendBlockerCheck(claim, env);
+    }
+
+    const report = formatBlockerReport(staleClaims);
+    if (report && env.ADMIN_USER_ID) {
+      await postMessage(env.ADMIN_USER_ID, report, env);
     }
   },
 };
