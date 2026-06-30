@@ -96,6 +96,19 @@ async function postEphemeral(channelId, userId, text, env) {
   });
 }
 
+async function openModal(triggerId, view, env) {
+  const resp = await fetch('https://slack.com/api/views.open', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${env.SLACK_BOT_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ trigger_id: triggerId, view }),
+  });
+  const data = await resp.json();
+  if (!data.ok) throw new Error(`views.open failed: ${data.error}`);
+}
+
 async function openClaimModal(triggerId, issues, channelId, userId, env) {
   const storedGhUser = await env.TICKET_STORE.get(`github_user:${userId}`) || '';
 
@@ -104,7 +117,7 @@ async function openClaimModal(triggerId, issues, channelId, userId, env) {
     value: String(issue.number),
   }));
 
-  const modal = {
+  await openModal(triggerId, {
     type: 'modal',
     callback_id: 'claim_issue',
     private_metadata: JSON.stringify({ channel_id: channelId }),
@@ -140,18 +153,7 @@ async function openClaimModal(triggerId, issues, channelId, userId, env) {
         },
       },
     ],
-  };
-
-  const resp = await fetch('https://slack.com/api/views.open', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${env.SLACK_BOT_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ trigger_id: triggerId, view: modal }),
-  });
-  const data = await resp.json();
-  if (!data.ok) throw new Error(`views.open failed: ${data.error}`);
+  }, env);
 }
 
 async function openAbandonModal(triggerId, claims, channelId, env) {
@@ -160,7 +162,7 @@ async function openAbandonModal(triggerId, claims, channelId, env) {
     value: String(claim.issueNumber),
   }));
 
-  const modal = {
+  await openModal(triggerId, {
     type: 'modal',
     callback_id: 'abandon_issue',
     private_metadata: JSON.stringify({ channel_id: channelId }),
@@ -184,18 +186,7 @@ async function openAbandonModal(triggerId, claims, channelId, env) {
         },
       },
     ],
-  };
-
-  const resp = await fetch('https://slack.com/api/views.open', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${env.SLACK_BOT_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ trigger_id: triggerId, view: modal }),
-  });
-  const data = await resp.json();
-  if (!data.ok) throw new Error(`views.open failed: ${data.error}`);
+  }, env);
 }
 
 async function openProgressModal(triggerId, claims, channelId, env) {
@@ -204,7 +195,7 @@ async function openProgressModal(triggerId, claims, channelId, env) {
     value: String(claim.issueNumber),
   }));
 
-  const modal = {
+  await openModal(triggerId, {
     type: 'modal',
     callback_id: 'post_progress',
     private_metadata: JSON.stringify({ channel_id: channelId }),
@@ -235,18 +226,7 @@ async function openProgressModal(triggerId, claims, channelId, env) {
         },
       },
     ],
-  };
-
-  const resp = await fetch('https://slack.com/api/views.open', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${env.SLACK_BOT_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ trigger_id: triggerId, view: modal }),
-  });
-  const data = await resp.json();
-  if (!data.ok) throw new Error(`views.open failed: ${data.error}`);
+  }, env);
 }
 
 // ── Response helpers ──────────────────────────────────────────────────────────
@@ -262,9 +242,16 @@ function ok() {
   return new Response('', { status: 200 });
 }
 
+// Reads a modal state value regardless of whether the block holds a select or text input.
+// All blocks in this app use action_id 'value', so the shape is values[blockId].value.{selected_option.value|value}.
+function stateVal(payload, blockId) {
+  const action = payload.view?.state?.values?.[blockId]?.value;
+  return action?.selected_option?.value ?? action?.value ?? null;
+}
+
 // ── Slash command handler ─────────────────────────────────────────────────────
 
-async function handleSlashCommand(request, env) {
+async function handleSlashCommand(request, env, ctx) {
   const body = await request.text();
 
   if (!await verifySlackSignature(request, body, env.SLACK_SIGNING_SECRET)) {
@@ -302,7 +289,7 @@ async function handleSlashCommand(request, env) {
           await postEphemeral(channelId, userId, `Failed to load issues: ${e.message}`, env);
         }
       };
-      if (typeof env._ctx?.waitUntil === 'function') env._ctx.waitUntil(work());
+      ctx.waitUntil(work());
       return ok();
     }
 
@@ -322,7 +309,7 @@ async function handleSlashCommand(request, env) {
           await postEphemeral(channelId, userId, `Failed to load your issues: ${e.message}`, env);
         }
       };
-      if (typeof env._ctx?.waitUntil === 'function') env._ctx.waitUntil(work());
+      ctx.waitUntil(work());
       return ok();
     }
 
@@ -342,7 +329,7 @@ async function handleSlashCommand(request, env) {
           await postEphemeral(channelId, userId, `Failed to load your issues: ${e.message}`, env);
         }
       };
-      if (typeof env._ctx?.waitUntil === 'function') env._ctx.waitUntil(work());
+      ctx.waitUntil(work());
       return ok();
     }
 
@@ -434,7 +421,7 @@ async function handleSlashCommand(request, env) {
 
 // ── Interaction handler (block_actions / modal submissions) ──────────────────
 
-async function handleInteraction(request, env) {
+async function handleInteraction(request, env, ctx) {
   const body = await request.text();
 
   if (!await verifySlackSignature(request, body, env.SLACK_SIGNING_SECRET)) {
@@ -455,7 +442,7 @@ async function handleInteraction(request, env) {
 
     if (callbackId === 'abandon_issue') {
       const userId = payload.user?.id;
-      const issueNumber = payload.view?.state?.values?.issue_select?.value?.selected_option?.value;
+      const issueNumber = stateVal(payload, 'issue_select');
       let meta = {};
       try { meta = JSON.parse(payload.view?.private_metadata || '{}'); } catch {}
       const channelId = meta.channel_id || userId;
@@ -481,14 +468,14 @@ async function handleInteraction(request, env) {
           await postMessage(userId, `❌ Failed to abandon issue: ${e.message}`, env);
         }
       };
-      if (typeof env._ctx?.waitUntil === 'function') env._ctx.waitUntil(work());
+      ctx.waitUntil(work());
       return ok();
     }
 
     if (callbackId === 'claim_issue') {
       const userId = payload.user?.id;
-      const issueNumber = payload.view?.state?.values?.issue_select?.value?.selected_option?.value;
-      const githubUsername = payload.view?.state?.values?.github_username?.value?.value?.trim();
+      const issueNumber = stateVal(payload, 'issue_select');
+      const githubUsername = stateVal(payload, 'github_username')?.trim();
       let meta = {};
       try { meta = JSON.parse(payload.view?.private_metadata || '{}'); } catch {}
       const channelId = meta.channel_id || userId;
@@ -531,14 +518,14 @@ async function handleInteraction(request, env) {
           await postMessage(userId, `❌ Failed to claim issue: ${e.message}`, env);
         }
       };
-      if (typeof env._ctx?.waitUntil === 'function') env._ctx.waitUntil(work());
+      ctx.waitUntil(work());
       return ok();
     }
 
     if (callbackId === 'post_progress') {
       const userId = payload.user?.id;
-      const issueNumber = payload.view?.state?.values?.issue_select?.value?.selected_option?.value;
-      const updateText = payload.view?.state?.values?.update_text?.value?.value?.trim();
+      const issueNumber = stateVal(payload, 'issue_select');
+      const updateText = stateVal(payload, 'update_text')?.trim();
       let meta = {};
       try { meta = JSON.parse(payload.view?.private_metadata || '{}'); } catch {}
       const channelId = meta.channel_id || env.SLACK_CHANNEL_ID;
@@ -567,7 +554,7 @@ async function handleInteraction(request, env) {
           await postMessage(userId, `❌ Failed to post update: ${e.message}`, env);
         }
       };
-      if (typeof env._ctx?.waitUntil === 'function') env._ctx.waitUntil(work());
+      ctx.waitUntil(work());
       return ok();
     }
   }
@@ -577,7 +564,7 @@ async function handleInteraction(request, env) {
 
 // ── GitHub webhook handler ────────────────────────────────────────────────────
 
-async function handleGitHubWebhook(request, env) {
+async function handleGitHubWebhook(request, env, ctx) {
   const body = await request.text();
 
   if (!await verifyGitHubSignature(request, body, env.GITHUB_WEBHOOK_SECRET)) {
@@ -634,7 +621,7 @@ async function handleGitHubWebhook(request, env) {
     }
   };
 
-  if (typeof env._ctx?.waitUntil === 'function') env._ctx.waitUntil(work());
+  ctx.waitUntil(work());
   return ok();
 }
 
@@ -642,23 +629,26 @@ async function handleGitHubWebhook(request, env) {
 
 export default {
   async fetch(request, env, ctx) {
-    env._ctx = ctx;
+    try {
+      const url = new URL(request.url);
 
-    const url = new URL(request.url);
+      if (request.method === 'POST' && url.pathname === '/slack/commands') {
+        return handleSlashCommand(request, env, ctx);
+      }
 
-    if (request.method === 'POST' && url.pathname === '/slack/commands') {
-      return handleSlashCommand(request, env);
+      if (request.method === 'POST' && url.pathname === '/slack/interactions') {
+        return handleInteraction(request, env, ctx);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/github/webhook') {
+        return handleGitHubWebhook(request, env, ctx);
+      }
+
+      return new Response('Not found', { status: 404 });
+    } catch (e) {
+      console.error('unhandled fetch error:', e);
+      return new Response('Internal Server Error', { status: 500 });
     }
-
-    if (request.method === 'POST' && url.pathname === '/slack/interactions') {
-      return handleInteraction(request, env);
-    }
-
-    if (request.method === 'POST' && url.pathname === '/github/webhook') {
-      return handleGitHubWebhook(request, env);
-    }
-
-    return new Response('Not found', { status: 404 });
   },
 
   async scheduled(event, env, ctx) {
